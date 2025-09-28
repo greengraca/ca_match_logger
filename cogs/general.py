@@ -54,6 +54,9 @@ ADMIN_COMMANDS: dict[str, str] = {
     "findmisnameddecks": "Find deck names in logs that aren't in the DB.",
     "correctmisnameddecks": "Fix a misnamed deck across logs and stats.",
     "editdeckindatabase": "Rename a deck across DB and logs.",
+    "deletetrack": "Delete a tracked match by its ID.",
+    "reindex": "Ensure MongoDB indexes (mods only).",
+    
 }
 
 ADMIN_CATEGORIES: dict[str, list[str]] = {
@@ -62,11 +65,13 @@ ADMIN_CATEGORIES: dict[str, list[str]] = {
         "findmisnameddecks",
         "correctmisnameddecks",
         "editdeckindatabase",
+        "reindex"
     ],
     "Match Admin": [
         "edittrack",
         "setplayerdeck",
         "setplayer",
+        "deletetrack"
     ],
 }
 

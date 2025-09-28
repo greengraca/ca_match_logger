@@ -6,10 +6,11 @@ from discord.commands import slash_command, Option
 
 from config import GUILD_ID, IS_DEV
 from db import individual_results, decks
-from utils.time_ranges import get_period_start, previous_month_window, format_period
+from utils.time_ranges import get_period_start, format_period
 from utils.text import capitalize_words, paginate_text
 from utils.views import PaginatorView
 from utils.ephemeral import should_be_ephemeral
+from typing import Annotated, List, Dict, Any
 
 
 
@@ -22,6 +23,83 @@ class Stats(commands.Cog):
         all_decks = [doc["name"] async for doc in cursor]
         q = (ctx.value or "").lower()
         return [d for d in all_decks if q in d.lower()]
+
+
+    async def top_10_decks_for_player_using_pipeline(
+        self,
+        player_id: int | str,
+        *,
+        period: str,
+        postban: bool,
+        min_games: int = 0,  # set >0 if you want to ignore tiny samples
+    ) -> List[Dict[str, Any]]:
+        pid_str = str(player_id)
+        pid_vals: List[Any] = [pid_str]
+        try:
+            pid_vals.append(int(pid_str))
+        except Exception:
+            pass
+
+        start = get_period_start(period, postban)
+        match_stage: Dict[str, Any] = {"player_id": {"$in": pid_vals}}
+        if start:
+            match_stage["date"] = {"$gte": start}
+
+        pipeline: List[Dict[str, Any]] = [
+            {"$match": match_stage},
+            {"$group": {
+                "_id": "$deck_name",
+                "wins": {"$sum": {"$cond": [{"$eq": ["$result", "win"]}, 1, 0]}},
+                "losses": {"$sum": {"$cond": [{"$eq": ["$result", "loss"]}, 1, 0]}},
+                "draws": {"$sum": {"$cond": [{"$eq": ["$result", "draw"]}, 1, 0]}},
+                "games_played": {"$sum": 1},
+            }},
+            {"$addFields": {
+                "weighted_wins": {"$add": ["$wins", {"$multiply": ["$draws", 0.143]}]},
+                "normal_win_percentage": {
+                    "$cond": [
+                        {"$gt": ["$games_played", 0]},
+                        {"$multiply": [{"$divide": ["$wins", "$games_played"]}, 100]},
+                        0,
+                    ]
+                },
+                "weighted_win_percentage": {
+                    "$cond": [
+                        {"$gt": ["$games_played", 0]},
+                        {"$multiply": [
+                            {"$divide": [{"$add": ["$wins", {"$multiply": ["$draws", 0.143]}]}, "$games_played"]},
+                            100,
+                        ]},
+                        0,
+                    ]
+                },
+            }},
+        ]
+
+        # Optional: filter by minimum games
+        if min_games > 0:
+            pipeline.append({"$match": {"games_played": {"$gte": min_games}}})
+
+        # Tie-breaks: weighted desc, then games desc, then name asc
+        pipeline.extend([
+            {"$sort": {"weighted_win_percentage": -1, "games_played": -1, "_id": 1}},
+            {"$limit": 10},
+        ])
+
+        out: List[Dict[str, Any]] = []
+        async for doc in individual_results.aggregate(pipeline):
+            out.append({
+                "deck_name": capitalize_words(doc["_id"] or "Unknown"),
+                "wins": int(doc["wins"]),
+                "losses": int(doc["losses"]),
+                "draws": int(doc["draws"]),
+                "games_played": int(doc["games_played"]),
+                "win_percentage": float(doc["normal_win_percentage"]),
+                "weighted_win_percentage": float(doc["weighted_win_percentage"]),
+            })
+        return out
+
+
 
     
     async def fetch_deck_stats(self, deck_name: str, period: str, postban: bool):
@@ -180,14 +258,18 @@ class Stats(commands.Cog):
         player: Annotated[discord.Member, Option(discord.Member, "Player")],
         period: Annotated[str, Option(str, "Period", choices=["1m", "3m", "6m", "1y", "all"], default="all")],
         postban: Annotated[bool, Option(bool, "Use post-ban date?", default=True)],
-        individual_deck: Annotated[str | None, Option(str, "Filter by deck", required=False)] = None,
+        individual_deck: Annotated[str | None, Option(str, "Filter by deck", autocomplete=deck_autocomplete, required=False)] = None,
     ):
+        eph = should_be_ephemeral(ctx)
+
         stats = await self.fetch_player_stats(player.id, period, postban, individual_deck)
-        rp = format_period(period); suffix = " (POST-BAN)" if postban else ""
+        rp = format_period(period)
+        suffix = " (POST-BAN)" if postban else ""
         fmt_name = capitalize_words(individual_deck) if individual_deck else ""
+
         if not stats:
             msg = f"No stats found for {player.display_name}" + (f" with `{fmt_name}`." if individual_deck else ".")
-            await ctx.respond(msg, ephemeral=False); 
+            await ctx.respond(msg, ephemeral=eph)
             return
 
         total = stats['wins'] + stats['losses'] + stats['draws']
@@ -196,7 +278,7 @@ class Stats(commands.Cog):
         wseat = lambda s: (stats[f'winseat{s}']/stats[f'seat{s}']*100) if stats[f'seat{s}'] else 0
 
         desc = (
-            f"**Total Games**: {total}\n"
+            f"**Total Games Played**: {total}\n"
             f"**{stats['wins']}** W | **{stats['losses']}** L | **{stats['draws']}** D\n\n"
             f"**Win %**: {winp:.2f}%\n"
             f"**🏋Win %**: {wwinp:.2f}%\n\n"
@@ -212,11 +294,30 @@ class Stats(commands.Cog):
                  if individual_deck else f"Player Stats for {player.display_name} - {rp}{suffix}")
         embed = discord.Embed(title=title, description=desc, color=0xFF0000 if IS_DEV else 0x00FF00)
 
-        if individual_deck and 'games' in stats:
-            games = stats['games']; n = len(games)
+        # When not filtering to one deck: append Top 10
+        if not individual_deck:
+            top = await self.top_10_decks_for_player_using_pipeline(
+                player.id, period=period, postban=postban, min_games=0  # bump to e.g. 5 if you want
+            )
+            if top:
+                section = ["\n**Top 10 Decks:**"]
+                for d in top:
+                    section.append(
+                        f"• **{d['deck_name']}** — {d['wins']} W | {d['losses']} L | {d['draws']} D\n"
+                        f"Games Played: {d['games_played']}, "
+                        f"Win%: {d['win_percentage']:.2f}%, "
+                        f"🏋Win%: {d['weighted_win_percentage']:.2f}%\n"
+                    )
+                embed.description += "\n" + "\n".join(section)
+
+
+        # If filtering to one deck: keep your existing dump behavior
+        if 'games' in stats:
+            games = stats['games']
+            n = len(games)
             if n == 0:
                 embed.description += f"\n\n🗃 0 games found with deck '{fmt_name}'."
-                await ctx.respond(embed=embed); 
+                await ctx.respond(embed=embed, ephemeral=eph)
                 return
 
             if n <= 5:
@@ -230,9 +331,10 @@ class Stats(commands.Cog):
                         dump += f"Seat {i}: {bold} {star}\n"
                     dump += "\n"
                 embed.description += "\n" + dump
-                await ctx.respond(embed=embed, ephemeral=False); 
+                await ctx.respond(embed=embed, ephemeral=eph)
                 return
 
+            # paginate (assuming you still have paginate_text & PaginatorView)
             entries = []
             for g in games:
                 d = f"{g['date'].strftime('%b')} {g['date'].day}, {g['date'].year}"
@@ -241,13 +343,14 @@ class Stats(commands.Cog):
                     name = p['deck_name']; star = "🏆" if p['winner'] else ""
                     t += f"Seat {i}: {name} {star}\n"
                 entries.append(t.strip())
+
             pages = paginate_text(entries)
-            view = PaginatorView(author=ctx.author, pages=pages)
             first = discord.Embed(title=f"📜 Game Dump (Page 1/{len(pages)})", description=pages[0], color=0x00FFCC)
-            await ctx.respond(embed=first, view=view, ephemeral=True); 
+            view = PaginatorView(author=ctx.author, pages=pages)
+            await ctx.respond(embed=first, view=view, ephemeral=True)
             return
 
-        await ctx.respond(embed=embed, ephemeral=should_be_ephemeral(ctx))
+        await ctx.respond(embed=embed, ephemeral=eph)
         
         
     @slash_command(guild_ids=[GUILD_ID], name="deckstats", description="Get statistics for a deck.")

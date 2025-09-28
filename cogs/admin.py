@@ -263,12 +263,7 @@ class SeatSelect(discord.ui.Select):
             content=f"Queued **seat** → `{pos_val}` for P{self.idx+1}.",
             view=None
         )
-    # async def callback(self, interaction: discord.Interaction):
-    #     pos_val = int(self.values[0])
-    #     cur = self.parent_view.edits.get(self.idx, {})
-    #     cur["position"] = pos_val
-    #     self.parent_view.edits[self.idx] = cur
-    #     await interaction.response.send_message(f"Queued **seat** → `{pos_val}` for P{self.idx+1}.", ephemeral=True)
+        
 
 class ConfirmDeckChangeView(discord.ui.View):
     def __init__(self, parent_view: "EditTrackView", idx: int, old_deck: str, new_deck: str):
@@ -452,7 +447,104 @@ class EditPlayerPanel(discord.ui.View):
         return cls(parent_view, idx, current, top)
     
 
+class DeleteTrackView(discord.ui.View):
+    def __init__(self, author_id: int, match_doc: dict):
+        super().__init__(timeout=90)
+        self.author_id = author_id
+        self.m = match_doc
+        self._done = False
 
+    def _same_person(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.author_id
+
+    def _summary_lines(self) -> list[str]:
+        lines = []
+        def _mention(pid): return f"<@{pid}>"
+        for i, p in enumerate(self.m.get("players", [])[:4], start=1):
+            raw_pos = p.get("position")
+            try:
+                seat = int(raw_pos)
+            except (TypeError, ValueError):
+                seat = "?"
+            lines.append(
+                f"**P{i}** • {_mention(p.get('player_id','?'))} • "
+                f"Seat {seat if seat in {1,2,3,4} else '?'} • "
+                f"Deck: *{p.get('deck_name','?')}* • Result: **{p.get('result','?')}**"
+            )
+        return lines
+
+    def _disable_all(self):
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="✅ Confirm delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, _, interaction: discord.Interaction):
+        if not self._same_person(interaction):
+            await interaction.response.send_message("Only the command invoker can confirm this.", ephemeral=True)
+            return
+        if self._done:
+            await interaction.response.send_message("This action has already been processed.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        # collect affected deck names before deletion
+        affected = []
+        for p in self.m.get("players", []):
+            dn = (p.get("deck_name") or "").strip()
+            if dn:
+                affected.append(dn)
+
+        # delete match + its individual_results
+        mid = self.m["match_id"]
+        await matches.delete_one({"match_id": mid})
+        await individual_results.delete_many({"match_id": mid})
+
+        # recompute players lists for affected decks
+        if affected:
+            await recompute_deck_players_for(decks, individual_results, affected)
+
+        # feedback
+        emb = discord.Embed(
+            title=f"🗑️ Match {mid} deleted",
+            description="\n".join(self._summary_lines()) or "_No players?_",
+            color=0xFF0000 if IS_DEV else 0x00FF00,
+        )
+        if affected:
+            emb.add_field(name="Deck stats updated", value=", ".join(sorted(set(affected))), inline=False)
+
+        self._disable_all()
+        self._done = True
+        await interaction.edit_original_response(embed=emb, view=self)
+
+    @discord.ui.button(label="✖️ Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, _, interaction: discord.Interaction):
+        if not self._same_person(interaction):
+            await interaction.response.send_message("Only the command invoker can cancel this.", ephemeral=True)
+            return
+        self._disable_all()
+        emb = discord.Embed(
+            title=f"❎ Deletion cancelled for match {self.m.get('match_id')}",
+            description="\n".join(self._summary_lines()) or "_No players?_",
+        )
+        await interaction.response.edit_message(embed=emb, view=self)
+
+    async def on_timeout(self):
+        # best-effort: disable buttons if the message is still editable
+        self._disable_all()
+
+
+def _parse_match_id(inp: str) -> int | None:
+    """Accepts a raw ID or a message link containing an ID-like number."""
+    if not inp:
+        return None
+    # take the first integer group you find
+    import re
+    m = re.search(r"\d+", str(inp))
+    try:
+        return int(m.group(0)) if m else None
+    except Exception:
+        return None
 
 
 # ---------- Cog ----------
@@ -1140,6 +1232,71 @@ class Admin(commands.Cog):
             ephemeral=eph,
             allowed_mentions=discord.AllowedMentions.none(),
         )
+        
+    # --- /deletetrack 
+
+
+    @slash_command(
+        guild_ids=[GUILD_ID],
+        name="deletetrack",
+        description="Delete a tracked match by ID (mods only) with confirm/cancel.",
+    )
+    async def deletetrack(
+        self,
+        ctx: discord.ApplicationContext,
+        match: Annotated[str, Option(str, "Match ID or link")],
+    ):
+        eph = should_be_ephemeral(ctx)
+        if not is_mod(ctx.author):
+            await ctx.respond(
+                embed=discord.Embed(title="Permission Denied", description="You do not have permission to use this command.", color=0xFF0000),
+                ephemeral=True,
+            )
+            return
+
+        mid = _parse_match_id(match)
+        if not mid:
+            await ctx.respond("Couldn't parse a match id from that input.", ephemeral=True)
+            return
+
+        m = await matches.find_one({"match_id": mid})
+        if not m:
+            await ctx.respond(f"No match found with id `{mid}`.", ephemeral=eph)
+            return
+
+        # show confirmation with buttons (only invoker can click)
+        lines = []
+        def _mention(pid): return f"<@{pid}>"
+        for i, p in enumerate(m.get("players", [])[:4], start=1):
+            try:
+                seat = int(p.get("position"))
+            except (TypeError, ValueError):
+                seat = "?"
+            lines.append(
+                f"**P{i}** • {_mention(p.get('player_id','?'))} • "
+                f"Seat {seat if seat in {1,2,3,4} else '?'} • "
+                f"Deck: *{p.get('deck_name','?')}* • Result: **{p.get('result','?')}**"
+            )
+
+        embed = discord.Embed(
+            title=f"Confirm deletion of match {m.get('match_id')}",
+            description="\n".join(lines) or "_No players?_",
+            color=0xFF7F7F,
+        )
+        view = DeleteTrackView(author_id=ctx.author.id, match_doc=m)
+        await ctx.respond(embed=embed, view=view, ephemeral=eph, allowed_mentions=discord.AllowedMentions.none())
+
+        
+    @slash_command(guild_ids=[GUILD_ID], name="reindex", description="Ensure MongoDB indexes (mods only).")
+    async def reindex(self, ctx: discord.ApplicationContext):
+        if not is_mod(ctx.author):
+            return await ctx.respond("Nope.", ephemeral=True)
+        await ctx.defer(ephemeral=True)
+        from db import ensure_indexes
+        await ensure_indexes()
+        await ctx.followup.send("Indexes ensured ✅", ephemeral=True)
+
+
 
 
 
