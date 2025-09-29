@@ -1,24 +1,47 @@
-# cogs/funding_kofi.py
 from __future__ import annotations
-import os, re, math, aiohttp, asyncio
+
+import os, re, json, asyncio
 from datetime import datetime, timezone
-from typing import Annotated, Optional, Dict, Any
+from typing import Optional, Dict, Any
 
 import discord
+from discord.commands import SlashCommandGroup, option
 from discord.ext import commands, tasks
-from discord.commands import slash_command, Option
 
 from config import GUILD_ID, IS_DEV
-from db import db  # expose Motor client/db or import specific collections if you prefer
+from db import db  # Motor database handle
 
-# Collections
-funding_months   = db.funding_months      # one doc per (guild_id, month)
-funding_pool     = db.funding_pool        # one doc per guild: prize_pool_cents
-funding_tokens   = db.funding_tokens      # token -> {guild_id, user_id, created}
-funding_meta     = db.funding_meta        # cursors, e.g. last seen Ko-fi txn ids
+# === Mongo collections ===
+funding_months   = db.funding_months
+funding_pool     = db.funding_pool
+funding_tokens   = db.funding_tokens
 
-OWNER_ID = 399635760254550026
-ROLE_NAME = "Arena Vanguard"  # change if you want
+# === Config ===
+OWNER_ID      = 399635760254550026
+ROLE_NAME     = os.getenv("FUND_ROLE_NAME", "ARENA VANGUARD")
+SUPPORT_CH_ID = int(os.getenv("FUND_CHANNEL_ID", "0") or 0)        # 🤝support-commander-arena
+INBOX_CH_ID   = int(os.getenv("KOFI_INBOX_CHANNEL_ID", "0") or 0)  # 🌐kofi-inbox (webhook posts land here)
+KOFI_URL      = os.getenv("KOFI_URL") or "https://ko-fi.com/commanderarena"
+MBWAY_PHONE   = os.getenv("MBWAY_PHONE") or "913 574 872"
+KOFI_DEBUG = os.getenv("KOFI_DEBUG", "0") == "1"
+
+CODE_RE = re.compile(r"\bVANG-[A-Fa-f0-9x\-]{6,}\b")
+
+EXPLAINER_TEXT = (
+    "Hey everyone! \n\n"
+    "Running this bot costs about €10/month.\n"
+    "We’ve always split it between the moderators for over a year, but since many of you asked, we set up a way for the community to chip in.\n\n"
+    "Even if we don’t reach 100%, the mods will cover the rest as always. If we go over the goal for the month, the extra rolls into our **Prize Pool** for the next big tournament.\n\n"
+    "As a thank-you, supporters get the role **ARENA VANGUARD** to show you’re an awesome Commander Arena supporter :green_heart:.\n\n"
+    ":arrow_right: **How to get the role automatically**: \n"
+    "- run `/fund mycode`\n"
+    "- copy your code, and paste it in the message field on Ko-fi when you make your donation\n"
+    "*The bot matches it and grants your role automatically.*\n\n"
+    "**Ko-fi** is the easiest: monthly or one-time on the page.\n"
+    "**MB WAY** is also available — tap the button for details.\n\n"
+    "------------------------------------------\n"
+)
+
 
 def month_key(dt: Optional[datetime] = None) -> str:
     dt = dt or datetime.now(timezone.utc)
@@ -31,21 +54,40 @@ def cents_to_eur(c: int) -> str:
     return f"{c/100:.2f}"
 
 def make_bar(progress: float, width: int = 24) -> str:
-    # progress: 0..1
     filled = max(0, min(width, int(round(progress * width))))
     return "▰" * filled + "▱" * (width - filled)
 
 def default_goal_cents() -> int:
-    return eur_to_cents(10.0)
+    return eur_to_cents(float(os.getenv("FUND_GOAL", "10")))
+
+# ENV: FUND_RATES='{"EUR":1.0,"USD":0.93,"GBP":1.17}'
+def to_eur_cents(amount_str: str | float | None, currency: str) -> int:
+    try:
+        amount = float(amount_str or 0)
+    except Exception:
+        return 0
+    try:
+        rates = json.loads(os.getenv("FUND_RATES", '{"EUR":1.0}'))
+    except Exception:
+        rates = {"EUR": 1.0}
+    rate = float(rates.get((currency or "EUR").upper(), 0))
+    return max(0, int(round(amount * rate * 100)))
+
 
 async def ensure_role(guild: discord.Guild) -> Optional[discord.Role]:
     role = discord.utils.get(guild.roles, name=ROLE_NAME)
     if role:
         return role
     try:
-        return await guild.create_role(name=ROLE_NAME, reason="Supporter role for Ko-fi donors")
+        return await guild.create_role(
+            name=ROLE_NAME,
+            reason="Supporter role for Ko-fi donors",
+            color=discord.Color.green(),
+            mentionable=True,
+        )
     except Exception:
         return None
+
 
 async def give_role(guild: discord.Guild, user_id: int):
     role = await ensure_role(guild)
@@ -57,86 +99,210 @@ async def give_role(guild: discord.Guild, user_id: int):
     except Exception:
         pass
 
+async def last_month_doc(guild_id: int) -> Optional[Dict[str, Any]]:
+    return await funding_months.find_one({"guild_id": guild_id}, sort=[("month", -1)])
+
 async def get_or_create_month(guild_id: int) -> Dict[str, Any]:
     mk = month_key()
     doc = await funding_months.find_one({"guild_id": guild_id, "month": mk})
     if doc:
         return doc
-    # carry over prize pool (global)
-    pool = await funding_pool.find_one({"guild_id": guild_id}) or {"guild_id": guild_id, "prize_pool_cents": 0}
+
+    await funding_pool.update_one(
+        {"guild_id": guild_id},
+        {"$setOnInsert": {"guild_id": guild_id, "prize_pool_cents": 0}},
+        upsert=True
+    )
+
+    prev = await last_month_doc(guild_id)
     doc = {
         "guild_id": guild_id,
         "month": mk,
         "goal_cents": default_goal_cents(),
         "total_cents": 0,
-        "channel_id": None,
-        "sticky_message_id": None,
-        "recurring_url": None,
-        "onetime_url": None,
-        "seen_txn_ids": [],  # Ko-fi txn ids processed this month
+        "channel_id": (prev or {}).get("channel_id") or SUPPORT_CH_ID or None,
+        "explainer_message_id": (prev or {}).get("explainer_message_id"),   # NEW
+        "sticky_message_id": (prev or {}).get("sticky_message_id"),
+        "kofi_url": (prev or {}).get("kofi_url") or KOFI_URL,
+        "seen_txn_ids": [],
+        "donations": [],
     }
     await funding_months.insert_one(doc)
-    # ensure pool doc exists
-    await funding_pool.update_one({"guild_id": guild_id}, {"$setOnInsert": pool}, upsert=True)
     return await funding_months.find_one({"guild_id": guild_id, "month": mk})
 
-def make_embed(doc: Dict[str, Any], guild: discord.Guild, pool_cents: int) -> discord.Embed:
-    goal = doc.get("goal_cents", default_goal_cents())
-    total = doc.get("total_cents", 0)
+
+def make_embed(doc: Dict[str, Any], pool_cents: int) -> discord.Embed:
+    goal = int(doc.get("goal_cents", default_goal_cents()))
+    total = int(doc.get("total_cents", 0))
     pct = 0.0 if goal <= 0 else min(1.0, total / goal)
     bar = make_bar(pct)
     mk = doc.get("month")
-    title = f"Commander Arena — Monthly Goal ({mk})"
+
     desc = (
-        f"**This month:** €{cents_to_eur(total)} / €{cents_to_eur(goal)}\n"
-        f"{bar}  `{int(pct*100)}%`\n\n"
+        f"**This month:** €{cents_to_eur(total)} / €{cents_to_eur(goal)}  ({int(pct*100)}%)\n"
+        f"`{bar}`\n\n"
         f"**Prize Pool:** €{cents_to_eur(pool_cents)}"
     )
     color = 0xFF0000 if IS_DEV else 0x00FF00
-    return discord.Embed(title=title, description=desc, color=color)
+    return discord.Embed(title=f"Commander Arena — Monthly Goal ({mk})", description=desc, color=color)
+
 
 class FundingView(discord.ui.View):
-    def __init__(self, recurring_url: Optional[str], onetime_url: Optional[str]):
+    """Persistent view: Ko-fi (green preferred) + MB WAY button, both ephemeral helpers."""
+    def __init__(self, kofi_url: Optional[str], mbway_phone: Optional[str]):
         super().__init__(timeout=None)
-        # Put recurring first & primary
-        if recurring_url:
-            self.add_item(discord.ui.Button(label="❤️ Help each month", style=discord.ButtonStyle.primary, url=recurring_url))
-        if onetime_url:
-            self.add_item(discord.ui.Button(label="☕ One-time help", style=discord.ButtonStyle.secondary, url=onetime_url))
-        # Optional: add a “Get my code” button via link to /fund mycode instructions? (Buttons can’t trigger slash, so we keep it simple.)
+        self.kofi_url = kofi_url or KOFI_URL
+        self.mbway_phone = mbway_phone or MBWAY_PHONE
 
+    @discord.ui.button(label="💚 Support on Ko-fi", style=discord.ButtonStyle.success, custom_id="fund:kofi")
+    async def kofi_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        text = (
+            f"Open Ko-fi → {self.kofi_url}\n\n"
+            "You can choose **monthly** or **one-time** on the Ko-fi page.\n"
+            "Don’t forget: run `/fund mycode` and paste that code in your Ko-fi **message** once "
+            "to get **ARENA VANGUARD** automatically."
+        )
+        await interaction.response.send_message(text, ephemeral=True, delete_after=120)
+
+    @discord.ui.button(label="📱 MB WAY (PT)", style=discord.ButtonStyle.secondary, custom_id="fund:mbway")
+    async def mbway_btn(self, button: discord.ui.Button, interaction: discord.Interaction):
+        msg = (
+            "**MB WAY (Portugal)**\n"
+            f"Send to: **`{self.mbway_phone}`**\n"
+            "Amount: **any value ≥ €1**\n"
+            f"Message: your Discord name (so we can assign your **{ROLE_NAME}** role).\n"
+            "If the role isn’t added within 24h, ping a mod or open a ticket. Thanks! 💚"
+        )
+        await interaction.response.send_message(msg, ephemeral=True, delete_after=120)
+
+
+# ----- checks & permissions helpers -----
+def owner_only():
+    def predicate(ctx: discord.ApplicationContext):
+        return ctx.author.id == OWNER_ID
+    return commands.check(predicate)
+
+# ===========================================================
+#                         COG
+# ===========================================================
 class FundingKoFi(commands.Cog):
+    """Ko-fi funding via Cloudflare→Discord webhook. Single sticky + role grant."""
+
     def __init__(self, bot):
         self.bot = bot
-        self.kofi_sync.start()
+        self._view_registered = False  # register persistent view on first on_ready only
+        self._sticky_lock = asyncio.Lock()
+        self.monthly_tick.start()
 
     def cog_unload(self):
-        self.kofi_sync.cancel()
+        self.monthly_tick.cancel()
 
-    # ---------- Helpers ----------
+    # ---------- register view & ensure sticky when bot is ready ----------
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self._view_registered:
+            self.bot.add_view(FundingView(KOFI_URL, MBWAY_PHONE))
+            self._view_registered = True
 
-    async def _refresh_sticky(self, guild: discord.Guild):
-        doc = await get_or_create_month(guild.id)
-        pool = await funding_pool.find_one({"guild_id": guild.id}) or {"prize_pool_cents": 0}
-        ch_id, msg_id = doc.get("channel_id"), doc.get("sticky_message_id")
-        if not ch_id or not msg_id:
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild:
+            await self._ensure_sticky_exists(guild)
+
+    # Slash groups (py-cord)
+    fund = SlashCommandGroup("fund", "Help Commander Arena by funding our bot", guild_ids=[GUILD_ID])
+    prizepool = fund.create_subgroup("prizepool", "Owner-only prize pool actions")
+
+    # ------ helpers ------
+    
+    async def _ensure_explainer_exists(self, guild: discord.Guild, doc: Dict[str, Any]) -> None:
+        ch_id = doc.get("channel_id") or SUPPORT_CH_ID
+        if not ch_id:
             return
         try:
             ch = guild.get_channel(int(ch_id)) or await guild.fetch_channel(int(ch_id))
-            msg = await ch.fetch_message(int(msg_id))
         except Exception:
             return
-        emb = make_embed(doc, guild, pool.get("prize_pool_cents", 0))
-        view = FundingView(doc.get("recurring_url"), doc.get("onetime_url"))
-        try:
-            await msg.edit(embed=emb, view=view)
-        except Exception:
-            pass
+
+        msg_id = doc.get("explainer_message_id")
+        if msg_id:
+            try:
+                msg = await ch.fetch_message(int(msg_id))
+                if msg.content != EXPLAINER_TEXT:
+                    await msg.edit(content=EXPLAINER_TEXT)
+                return
+            except Exception:
+                pass  # fall through and recreate if missing
+
+        # Post explainer first so it stays *above* the embed chronologically
+        expl = await ch.send(EXPLAINER_TEXT)
+        await funding_months.update_one(
+            {"guild_id": guild.id, "month": doc["month"]},
+            {"$set": {"explainer_message_id": expl.id, "channel_id": ch.id}}
+        )
+
+
+    async def _ensure_sticky_exists(self, guild: discord.Guild):
+        async with self._sticky_lock:
+            doc = await get_or_create_month(guild.id)
+
+            # 1) Ensure explainer message (top)
+            await self._ensure_explainer_exists(guild, doc)
+
+            # 2) Ensure/edit the sticky embed message (below)
+            ch_id = doc.get("channel_id") or SUPPORT_CH_ID
+            if not ch_id:
+                return
+            try:
+                ch = guild.get_channel(int(ch_id)) or await guild.fetch_channel(int(ch_id))
+            except Exception:
+                return
+
+            pool = await funding_pool.find_one({"guild_id": guild.id}) or {"prize_pool_cents": 0}
+            emb = make_embed(doc, int(pool.get("prize_pool_cents", 0)))
+            view = FundingView(doc.get("kofi_url") or KOFI_URL, MBWAY_PHONE)
+
+            msg = None
+            msg_id = doc.get("sticky_message_id")
+            if msg_id:
+                try:
+                    msg = await ch.fetch_message(int(msg_id))
+                except Exception:
+                    msg = None
+
+            if msg is None:
+                try:
+                    async for m in ch.history(limit=10):
+                        if m.author.id == self.bot.user.id and m.embeds:
+                            e = m.embeds[0]
+                            if e.title and e.title.startswith("Commander Arena — Monthly Goal"):
+                                msg = m
+                                await funding_months.update_one(
+                                    {"guild_id": guild.id, "month": doc["month"]},
+                                    {"$set": {"channel_id": ch.id, "sticky_message_id": m.id}}
+                                )
+                                break
+                except Exception:
+                    pass
+
+            if msg:
+                try:
+                    await msg.edit(embed=emb, view=view)
+                except Exception:
+                    pass
+            else:
+                msg = await ch.send(embed=emb, view=view)
+                await funding_months.update_one(
+                    {"guild_id": guild.id, "month": doc["month"]},
+                    {"$set": {"channel_id": ch.id, "sticky_message_id": msg.id}}
+                )
+
+
+    async def _refresh_sticky(self, guild: discord.Guild):
+        await self._ensure_sticky_exists(guild)
 
     async def _apply_overflow_to_pool(self, guild_id: int, prev_total: int, new_total: int, goal: int):
         if new_total <= goal:
             return
-        # Only add the *incremental* overflow to the pool
         prev_over = max(0, prev_total - goal)
         new_over  = max(0, new_total - goal)
         inc = new_over - prev_over
@@ -147,225 +313,221 @@ class FundingKoFi(commands.Cog):
                 upsert=True
             )
 
-    # ---------- Slash commands ----------
-
-    @slash_command(guild_ids=[GUILD_ID], name="fund", description="Funding & Prize Pool")
-    async def fund_root(self, ctx: discord.ApplicationContext):
-        await ctx.respond("Use subcommands: setup, mycode, refresh, set-goal, set-links, add, prizepool reset", ephemeral=True)
-
-    @fund_root.subcommand(name="setup", description="Create/attach the monthly sticky in a channel.")
-    async def fund_setup(
-        self,
-        ctx: discord.ApplicationContext,
-        channel: Annotated[discord.TextChannel, Option(discord.TextChannel, "Channel")],
-        goal_eur: Annotated[float, Option(float, "Monthly goal in EUR", required=False)] = 10.0,
-        recurring_url: Annotated[str | None, Option(str, "Ko-fi membership URL", required=False)] = None,
-        onetime_url: Annotated[str | None, Option(str, "Ko-fi one-time URL", required=False)] = None,
-        lock_channel: Annotated[bool, Option(bool, "Lock channel for messages?", required=False)] = True,
-    ):
-        await ctx.defer(ephemeral=True)
-        doc = await get_or_create_month(ctx.guild.id)
-        # Save settings
-        upd = {"goal_cents": eur_to_cents(goal_eur)}
-        if recurring_url: upd["recurring_url"] = recurring_url
-        if onetime_url:   upd["onetime_url"] = onetime_url
-
-        # Create sticky if missing
-        if not doc.get("sticky_message_id") or doc.get("channel_id") != channel.id:
-            emb = make_embed(doc | upd, ctx.guild, (await funding_pool.find_one({"guild_id": ctx.guild.id}) or {}).get("prize_pool_cents", 0))
-            view = FundingView(upd.get("recurring_url") or doc.get("recurring_url"), upd.get("onetime_url") or doc.get("onetime_url"))
-            msg = await channel.send(embed=emb, view=view)
-            upd["channel_id"] = channel.id
-            upd["sticky_message_id"] = msg.id
-
-        await funding_months.update_one({"guild_id": ctx.guild.id, "month": doc["month"]}, {"$set": upd})
-
-        # Lock channel (optional)
-        if lock_channel:
-            try:
-                overwrites = channel.overwrites_for(ctx.guild.default_role)
-                overwrites.send_messages = False
-                await channel.set_permissions(ctx.guild.default_role, overwrite=overwrites)
-            except Exception:
-                pass
-
-        await ctx.followup.send("Funding sticky ready ✅", ephemeral=True)
-
-    @fund_root.subcommand(name="mycode", description="Get your personal Ko-fi link code to earn the Arena Vanguard role.")
+    # ------ commands ------
+    # Public
+    @fund.command(name="mycode", description="Get your personal code; paste it in Ko-fi message to auto-get the role.", dm_permission=False)
     async def fund_mycode(self, ctx: discord.ApplicationContext):
-        token = f"VANG-{ctx.author.id:x}-{os.urandom(2).hex()}"
-        await funding_tokens.update_one(
-            {"token": token}, {"$set": {"guild_id": ctx.guild.id, "user_id": ctx.author.id, "created": datetime.now(timezone.utc)}}, upsert=True
+        # Try to reuse the most recent token for this user in this guild
+        existing = await funding_tokens.find_one(
+            {"guild_id": ctx.guild.id, "user_id": ctx.author.id},
+            sort=[("created", -1)]
         )
+        if existing:
+            token = existing["token"]
+        else:
+            token = f"VANG-{ctx.author.id:x}-{os.urandom(2).hex()}"
+            await funding_tokens.insert_one({
+                "token": token,
+                "guild_id": ctx.guild.id,
+                "user_id": ctx.author.id,
+                "created": datetime.now(timezone.utc),
+            })
+
         msg = (
-            f"Copy this code and paste it in the **message** field when you donate on Ko-fi:\n"
+            "Copy this code and paste it in the **message** field when you donate on Ko-fi:\n"
             f"```{token}```\n"
-            "Once your support is processed, I’ll automatically grant you the **Arena Vanguard** role.\n"
-            "Tip: use the buttons in the funding channel to open Ko-fi."
+            f"Once Ko-fi notifies us, you’ll automatically receive **{ROLE_NAME}**.\n"
+            f"Prefer MB WAY? Use the button in the funding channel."
         )
         await ctx.respond(msg, ephemeral=True)
 
-    @fund_root.subcommand(name="refresh", description="Refresh the sticky embed now.")
+
+
+    # Mods only (visible to members with Manage Server)
+    @fund.command(
+        name="refresh",
+        description="Refresh the sticky embed now.",
+        default_member_permissions=discord.Permissions(manage_guild=True),
+        dm_permission=False,
+    )
     async def fund_refresh(self, ctx: discord.ApplicationContext):
         await self._refresh_sticky(ctx.guild)
         await ctx.respond("Refreshed ✅", ephemeral=True)
 
-    @fund_root.subcommand(name="set-goal", description="Set monthly goal (EUR).")
-    async def fund_set_goal(self, ctx: discord.ApplicationContext, amount_eur: Annotated[float, Option(float, "EUR")]):
-        doc = await get_or_create_month(ctx.guild.id)
-        await funding_months.update_one({"guild_id": ctx.guild.id, "month": doc["month"]}, {"$set": {"goal_cents": eur_to_cents(amount_eur)}})
-        await self._refresh_sticky(ctx.guild)
-        await ctx.respond(f"Goal set to €{amount_eur:.2f} ✅", ephemeral=True)
-
-    @fund_root.subcommand(name="set-links", description="Update Ko-fi buttons.")
-    async def fund_set_links(
-        self,
-        ctx: discord.ApplicationContext,
-        recurring_url: Annotated[str, Option(str, "Membership URL")],
-        onetime_url: Annotated[str, Option(str, "One-time URL")],
-    ):
+    # Owner-only (hide from most by requiring Administrator, plus hard check)
+    @fund.command(
+        name="set-goal",
+        description="Set monthly goal (EUR).",
+        default_member_permissions=discord.Permissions(administrator=True),
+        dm_permission=False,
+    )
+    @owner_only()
+    @option("amount_eur", float, description="EUR")
+    async def fund_set_goal(self, ctx: discord.ApplicationContext, amount_eur: float):
         doc = await get_or_create_month(ctx.guild.id)
         await funding_months.update_one(
             {"guild_id": ctx.guild.id, "month": doc["month"]},
-            {"$set": {"recurring_url": recurring_url, "onetime_url": onetime_url}},
+            {"$set": {"goal_cents": eur_to_cents(amount_eur)}}
         )
         await self._refresh_sticky(ctx.guild)
-        await ctx.respond("Links updated ✅", ephemeral=True)
+        await ctx.respond(f"Goal set to €{amount_eur:.2f} ✅", ephemeral=True)
 
-    @fund_root.subcommand(name="add", description="Owner-only: manually add a donation (EUR).")
-    async def fund_add(self, ctx: discord.ApplicationContext, amount_eur: Annotated[float, Option(float, "EUR")], note: Annotated[str, Option(str, "Note", required=False)] = ""):
-        if ctx.author.id != OWNER_ID:
-            return await ctx.respond("Only the owner can use this.", ephemeral=True)
-
+    @fund.command(
+        name="add",
+        description="Owner-only: manually add a donation (EUR).",
+        default_member_permissions=discord.Permissions(administrator=True),
+        dm_permission=False,
+    )
+    @owner_only()
+    @option("amount_eur", float, description="EUR")
+    @option("note", str, description="Note", required=False, default="")
+    async def fund_add(self, ctx: discord.ApplicationContext, amount_eur: float, note: str):
         doc = await get_or_create_month(ctx.guild.id)
-        prev_total = doc.get("total_cents", 0)
-        goal = doc.get("goal_cents", default_goal_cents())
+        prev_total = int(doc.get("total_cents", 0))
+        goal = int(doc.get("goal_cents", default_goal_cents()))
         inc = eur_to_cents(amount_eur)
         new_total = prev_total + inc
 
         await funding_months.update_one(
             {"guild_id": ctx.guild.id, "month": doc["month"]},
-            {"$inc": {"total_cents": inc},
-             "$push": {"donations": {"amount_cents": inc, "source": "manual", "note": note, "ts": datetime.now(timezone.utc)}}}
+            {
+                "$inc": {"total_cents": inc},
+                "$push": {
+                    "donations": {
+                        "amount_cents": inc,
+                        "source": "manual",
+                        "note": note,
+                        "ts": datetime.now(timezone.utc),
+                    }
+                },
+            },
         )
         await self._apply_overflow_to_pool(ctx.guild.id, prev_total, new_total, goal)
         await self._refresh_sticky(ctx.guild)
         await ctx.respond(f"Added €{amount_eur:.2f} ✅", ephemeral=True)
 
-    @fund_root.subcommand(name="prizepool", description="Owner-only prize pool actions")
-    async def fund_pool_group(self, ctx: discord.ApplicationContext):
-        await ctx.respond("Use subcommand: reset", ephemeral=True)
-
-    @fund_pool_group.subcommand(name="reset", description="Owner-only: reset prize pool to €0.00")
+    @prizepool.command(
+        name="reset",
+        description="Owner-only: reset prize pool to €0.00",
+        default_member_permissions=discord.Permissions(administrator=True),
+        dm_permission=False,
+    )
+    @owner_only()
     async def fund_pool_reset(self, ctx: discord.ApplicationContext):
-        if ctx.author.id != OWNER_ID:
-            return await ctx.respond("Only the owner can use this.", ephemeral=True)
         await funding_pool.update_one({"guild_id": ctx.guild.id}, {"$set": {"prize_pool_cents": 0}}, upsert=True)
         await self._refresh_sticky(ctx.guild)
         await ctx.respond("Prize Pool reset ✅", ephemeral=True)
 
-    # ---------- Ko-fi sync (API polling, no webhooks server needed) ----------
 
-    @tasks.loop(minutes=5)
-    async def kofi_sync(self):
-        await self.bot.wait_until_ready()
-        token = os.getenv("KOFI_API_TOKEN")
-        if not token:
+    # ------ consume Cloudflare→Discord webhook posts ------
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Only handle webhook posts in the Ko-fi inbox channel
+        if not INBOX_CH_ID or message.channel.id != INBOX_CH_ID:
             return
-        url = f"https://api.ko-fi.com/v1/supporters?token={token}"
+        if not message.webhook_id:
+            return
+
+        m = re.search(r"```json\s*([\s\S]+?)\s*```", message.content or "")
+        if not m:
+            return
         try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(url, timeout=20) as r:
-                    data = await r.json()
+            payload = json.loads(m.group(1))
         except Exception:
             return
 
-        # Ko-fi returns recent supporters; normalize shape
-        supporters = data.get("data") or data  # depending on API variant
-        if not isinstance(supporters, list):
-            return
-
-        # Process per-guild (single guild in your case)
         guild = self.bot.get_guild(GUILD_ID)
         if not guild:
             return
-
         doc = await get_or_create_month(guild.id)
-        seen: set[str] = set(doc.get("seen_txn_ids") or [])
-        prev_total = doc.get("total_cents", 0)
-        goal = doc.get("goal_cents", default_goal_cents())
 
-        new_txn_ids = []
-        incr_total = 0
+        # de-dupe by Ko-fi transaction id
+        txn = str(payload.get("kofi_transaction_id") or "")
+        if txn and txn in (doc.get("seen_txn_ids") or []):
+            if not KOFI_DEBUG:
+                try: await message.delete()
+                except Exception: pass
+            return
 
-        # Build token index for fast matching
-        tokens = {}
-        async for t in funding_tokens.find({"guild_id": guild.id}):
-            tokens[t["token"]] = t["user_id"]
+        # only EUR for now
+        currency = (payload.get("currency") or "EUR").upper()
+        inc = to_eur_cents(payload.get("amount"), currency)
+        if inc <= 0:
+            if not KOFI_DEBUG:
+                try: await message.delete()
+                except Exception: pass
+            return
 
-        for sup in supporters:
-            # Fields: 'kofi_transaction_id', 'amount', 'currency', 'timestamp', 'message', 'type', 'is_public', 'is_subscription_payment'
-            txn = str(sup.get("kofi_transaction_id") or "")
-            if not txn or txn in seen:
-                continue
-            # Accept donations + subscription payments
-            typ = (sup.get("type") or "").lower()
-            is_sub = bool(sup.get("is_subscription_payment"))
-            if typ not in ("donation", "subscription", "shoporder", "commission") and not is_sub:
-                continue
 
-            currency = (sup.get("currency") or "EUR").upper()
-            if currency != "EUR":
-                continue  # keep it simple; you can add FX later
+        # amount -> cents
+        try:
+            inc = int(round(float(payload.get("amount") or 0) * 100))
+        except Exception:
+            inc = 0
+        if inc <= 0:
+            if not KOFI_DEBUG:
+                try: await message.delete()
+                except Exception: pass
+            return
 
-            try:
-                amount_cents = eur_to_cents(float(sup.get("amount") or 0))
-            except Exception:
-                amount_cents = 0
-            if amount_cents <= 0:
-                continue
+        # try to match a user token in the Ko-fi message
+        linked_user_id: Optional[int] = None
+        msg_text = payload.get("message") or ""
+        cm = CODE_RE.search(msg_text)
+        if cm:
+            token = cm.group(0)
+            row = await funding_tokens.find_one({"token": token, "guild_id": guild.id})
+            if row:
+                linked_user_id = int(row["user_id"])
+                # (optional) mark token used:
+                await funding_tokens.update_one({"token": token}, {"$set": {"used": True, "used_at": datetime.now(timezone.utc)}})
 
-            # Try to link to a user via token in message
-            msg = sup.get("message") or ""
-            linked_user_id = None
-            for token_str, user_id in tokens.items():
-                if token_str in msg:
-                    linked_user_id = int(user_id)
-                    break
+        prev_total = int(doc.get("total_cents", 0))
+        goal = int(doc.get("goal_cents", default_goal_cents()))
+        new_total = prev_total + inc
 
-            # Record donation
-            donation_row = {
-                "amount_cents": amount_cents,
-                "source": "kofi-sub" if (is_sub or typ == "subscription") else "kofi",
+        updates: Dict[str, Any] = {
+            "$inc": {"total_cents": inc},
+            "$push": {"donations": {
+                "amount_cents": inc,
+                "source": "kofi" if not payload.get("is_subscription_payment") else "kofi-sub",
                 "ts": datetime.now(timezone.utc),
                 "kofi_txn": txn,
                 "linked_user_id": linked_user_id,
-            }
-            await funding_months.update_one(
-                {"guild_id": guild.id, "month": doc["month"]},
-                {"$push": {"donations": donation_row}}
-            )
+                "orig_amount": payload.get("amount"),
+                "orig_currency": currency,
+            }},
+        }
+        if txn:
+            updates["$addToSet"] = {"seen_txn_ids": txn}
 
-            incr_total += amount_cents
-            new_txn_ids.append(txn)
+        await funding_months.update_one({"guild_id": guild.id, "month": doc["month"]}, updates)
+        await self._apply_overflow_to_pool(guild.id, prev_total, new_total, goal)
 
-            # Grant role if we matched the token
-            if linked_user_id:
-                await give_role(guild, linked_user_id)
+        if linked_user_id:
+            await give_role(guild, linked_user_id)
 
-        if incr_total or new_txn_ids:
-            new_total = prev_total + incr_total
-            await self._apply_overflow_to_pool(guild.id, prev_total, new_total, goal)
-            # Save totals and seen ids
-            await funding_months.update_one(
-                {"guild_id": guild.id, "month": doc["month"]},
-                {"$inc": {"total_cents": incr_total}, "$addToSet": {"seen_txn_ids": {"$each": new_txn_ids}}}
-            )
-            await self._refresh_sticky(guild)
+        await self._refresh_sticky(guild)
 
-    @kofi_sync.before_loop
-    async def _before_kofi(self):
+        # keep inbox clean in prod
+        if not KOFI_DEBUG:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
+    # Keep sticky fresh & ensure doc exists
+    @tasks.loop(hours=6)
+    async def monthly_tick(self):
         await self.bot.wait_until_ready()
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild:
+            await self._ensure_sticky_exists(guild)
+
+    @monthly_tick.before_loop
+    async def _before_tick(self):
+        await self.bot.wait_until_ready()
+        await asyncio.sleep(5)  # small delay to avoid racing manual setup
 
 def setup(bot):
     bot.add_cog(FundingKoFi(bot))

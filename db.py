@@ -1,7 +1,8 @@
+# db.py
 import os
 import motor.motor_asyncio
 from config import MONGO_URI, IS_DEV
-from pymongo import IndexModel, ASCENDING, DESCENDING  # <-- add this
+from pymongo import IndexModel, ASCENDING, DESCENDING
 
 _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 
@@ -20,11 +21,17 @@ counters = db.counters
 individual_results = db.individual_results
 event_registrations = db.event_registrations
 
+# Funding collections
+funding_months = db.funding_months
+funding_pool = db.funding_pool
+funding_tokens = db.funding_tokens
+
 
 async def ping():
     """Check MongoDB connectivity."""
     await _client.admin.command("ping")
     return True
+
 
 async def ensure_indexes():
     # matches
@@ -35,17 +42,42 @@ async def ensure_indexes():
     # individual_results
     await individual_results.create_indexes([
         IndexModel([("match_id", ASCENDING), ("player_id", ASCENDING)], name="ir_match_player"),
+        IndexModel([("player_id", ASCENDING), ("date", DESCENDING)], name="ir_player_date_desc"),
+        IndexModel([("deck_name", ASCENDING), ("date", DESCENDING)], name="ir_deck_date_desc"),
     ])
 
-    # decks (if you don't have dupes; otherwise clean before making it unique)
+    # decks (ensure no dupes first if you make it unique)
     await decks.create_indexes([
         IndexModel([("name", ASCENDING)], unique=True, name="uniq_deck_name"),
     ])
-    
+
+    # event_registrations
     await event_registrations.create_indexes([
         IndexModel([("event_id", ASCENDING), ("user_id", ASCENDING)], unique=True, name="uniq_event_user"),
         IndexModel([("event_id", ASCENDING)], name="by_event"),
     ])
+
+    # ----- Funding indexes -----
+    # One document per (guild_id, month)
+    await funding_months.create_indexes([
+        IndexModel([("guild_id", ASCENDING), ("month", ASCENDING)], unique=True, name="uniq_guild_month"),
+        IndexModel([("sticky_message_id", ASCENDING)], name="by_sticky_msg"),
+    ])
+
+    # One row per guild (accumulator)
+    await funding_pool.create_indexes([
+        IndexModel([("guild_id", ASCENDING)], unique=True, name="uniq_pool_guild"),
+    ])
+
+    # Tokens:
+    #  - token must be unique
+    #  - we keep a non-unique index on (guild_id, user_id) for lookups
+    await funding_tokens.create_indexes([
+        IndexModel([("token", ASCENDING)], unique=True, name="uniq_token"),
+        IndexModel([("guild_id", ASCENDING), ("user_id", ASCENDING)], name="by_guild_user"),
+        IndexModel([("created", DESCENDING)], name="by_created_desc"),
+    ])
+
 
 async def set_counter_to_max_match_id():
     """
@@ -66,4 +98,3 @@ async def set_counter_to_max_match_id():
         {"$set": {"sequence_value": max_existing}},
         upsert=True,
     )
-
