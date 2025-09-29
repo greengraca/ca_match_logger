@@ -3,6 +3,7 @@ import os
 import motor.motor_asyncio
 from config import MONGO_URI, IS_DEV
 from pymongo import IndexModel, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError
 
 _client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
 
@@ -79,22 +80,60 @@ async def ensure_indexes():
     ])
 
 
-async def set_counter_to_max_match_id():
-    """
-    Set counters.match_id.sequence_value to max(match_id) from `matches`.
-    Lowers the counter only if it's currently greater than that max.
-    If the doc doesn't exist, upsert it with the computed value.
-    """
+# ---------- counters helpers (safe + conflict-free) ----------
+
+async def get_max_match_id() -> int:
+    """Return the current maximum match_id in `matches` (0 if none)."""
     doc = await matches.find_one(
         sort=[("match_id", -1)],
-        projection={"_id": 0, "match_id": 1}
+        projection={"_id": 0, "match_id": 1},
     )
-    max_existing = int(doc["match_id"]) if doc and doc.get("match_id") is not None else 0
+    return int(doc["match_id"]) if doc and doc.get("match_id") is not None else 0
 
-    # Only lower if the counter is above max_existing.
-    # The filter prevents moving backwards if another process already advanced it.
+
+async def set_counter_to_max_match_id():
+    """
+    Ensure counters.match_id.sequence_value <= max(match_id) in `matches`.
+    Create the doc if missing. Safe under concurrent calls.
+    (Two-step update avoids modifier path conflicts.)
+    """
+    max_existing = await get_max_match_id()
+
+    # Step 1: ensure the doc exists (no $min here to avoid path conflicts)
+    try:
+        await counters.update_one(
+            {"_id": "match_id"},
+            {"$setOnInsert": {"sequence_value": max_existing}},
+            upsert=True,
+        )
+    except DuplicateKeyError:
+        # Another writer created it first — ignore.
+        pass
+
+    # Step 2: lower the counter if it's above the max (no upsert)
     await counters.update_one(
-        {"_id": "match_id", "sequence_value": {"$gt": max_existing}},
-        {"$set": {"sequence_value": max_existing}},
-        upsert=True,
+        {"_id": "match_id"},
+        {"$min": {"sequence_value": max_existing}},
+        upsert=False,
     )
+
+
+# ---------- deletion helper ----------
+
+async def delete_match_cascade(match_id: int) -> int:
+    """
+    Delete a match and any related docs; returns number of matches deleted (0 or 1).
+    Extend here if you add more match-scoped collections.
+    """
+    await individual_results.delete_many({"match_id": match_id})
+    res = await matches.delete_one({"match_id": match_id})
+    return res.deleted_count or 0
+
+
+# ---------- legacy helper kept for completeness ----------
+
+async def set_counter_to_max_match_id_legacy():
+    """
+    Older name kept for reference. Prefer set_counter_to_max_match_id().
+    """
+    return await set_counter_to_max_match_id()

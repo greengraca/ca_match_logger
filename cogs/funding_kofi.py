@@ -206,7 +206,10 @@ class FundingKoFi(commands.Cog):
 
         guild = self.bot.get_guild(GUILD_ID)
         if guild:
+            # make sure the role exists regardless of donations
+            await ensure_role(guild)
             await self._ensure_sticky_exists(guild)
+
 
     # Slash groups (py-cord)
     fund = SlashCommandGroup("fund", "Help Commander Arena by funding our bot", guild_ids=[GUILD_ID])
@@ -317,22 +320,12 @@ class FundingKoFi(commands.Cog):
     # Public
     @fund.command(name="mycode", description="Get your personal code; paste it in Ko-fi message to auto-get the role.", dm_permission=False)
     async def fund_mycode(self, ctx: discord.ApplicationContext):
-        # Try to reuse the most recent token for this user in this guild
-        existing = await funding_tokens.find_one(
+        token = f"VANG-{ctx.author.id:x}-{os.urandom(2).hex()}"
+        await funding_tokens.update_one(
             {"guild_id": ctx.guild.id, "user_id": ctx.author.id},
-            sort=[("created", -1)]
+            {"$set": {"token": token, "created": datetime.now(timezone.utc)}},
+            upsert=True
         )
-        if existing:
-            token = existing["token"]
-        else:
-            token = f"VANG-{ctx.author.id:x}-{os.urandom(2).hex()}"
-            await funding_tokens.insert_one({
-                "token": token,
-                "guild_id": ctx.guild.id,
-                "user_id": ctx.author.id,
-                "created": datetime.now(timezone.utc),
-            })
-
         msg = (
             "Copy this code and paste it in the **message** field when you donate on Ko-fi:\n"
             f"```{token}```\n"
@@ -340,6 +333,7 @@ class FundingKoFi(commands.Cog):
             f"Prefer MB WAY? Use the button in the funding channel."
         )
         await ctx.respond(msg, ephemeral=True)
+
 
 
 
@@ -380,8 +374,9 @@ class FundingKoFi(commands.Cog):
     )
     @owner_only()
     @option("amount_eur", float, description="EUR")
+    @option("supporter", discord.Member, description="Member to credit & grant role (optional)", required=False, default=None)
     @option("note", str, description="Note", required=False, default="")
-    async def fund_add(self, ctx: discord.ApplicationContext, amount_eur: float, note: str):
+    async def fund_add(self, ctx: discord.ApplicationContext, amount_eur: float, supporter: Optional[discord.Member], note: str):
         doc = await get_or_create_month(ctx.guild.id)
         prev_total = int(doc.get("total_cents", 0))
         goal = int(doc.get("goal_cents", default_goal_cents()))
@@ -398,13 +393,36 @@ class FundingKoFi(commands.Cog):
                         "source": "manual",
                         "note": note,
                         "ts": datetime.now(timezone.utc),
+                        "linked_user_id": supporter.id if supporter else None,
                     }
                 },
             },
         )
+
         await self._apply_overflow_to_pool(ctx.guild.id, prev_total, new_total, goal)
+
+        # Grant role if a supporter was specified
+        role_msg = ""
+        if supporter:
+            role = await ensure_role(ctx.guild)
+            if role:
+                try:
+                    # Only add if they don't already have it
+                    if role in supporter.roles:
+                        role_msg = f" (supporter {supporter.mention} already had {ROLE_NAME})"
+                    else:
+                        await supporter.add_roles(role, reason="Manual donation supporter")
+                        role_msg = f" (granted **{ROLE_NAME}** to {supporter.mention})"
+                except Exception as e:
+                    role_msg = f" (couldn't add role to {supporter.mention})"
+
         await self._refresh_sticky(ctx.guild)
-        await ctx.respond(f"Added €{amount_eur:.2f} ✅", ephemeral=True)
+
+        base = f"Added €{amount_eur:.2f}"
+        if supporter:
+            base += f" for {supporter.mention}"
+        await ctx.respond(f"{base} ✅{role_msg}", ephemeral=True)
+
 
     @prizepool.command(
         name="reset",
@@ -481,6 +499,12 @@ class FundingKoFi(commands.Cog):
                 linked_user_id = int(row["user_id"])
                 # (optional) mark token used:
                 await funding_tokens.update_one({"token": token}, {"$set": {"used": True, "used_at": datetime.now(timezone.utc)}})
+                
+        # fallback: Ko-fi linked account
+        if not linked_user_id:
+            duid = (payload.get("discord_userid") or "").strip()
+            if duid.isdigit():
+                linked_user_id = int(duid)
 
         prev_total = int(doc.get("total_cents", 0))
         goal = int(doc.get("goal_cents", default_goal_cents()))

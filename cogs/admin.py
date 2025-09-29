@@ -7,7 +7,14 @@ from discord.commands import slash_command, Option
 from rapidfuzz import fuzz, process
 
 from config import GUILD_ID, IS_DEV
-from db import decks, matches, individual_results, set_counter_to_max_match_id  
+from db import (
+    decks,
+    matches,
+    individual_results,
+    get_max_match_id,
+    delete_match_cascade,
+    set_counter_to_max_match_id,
+)
 from utils.ephemeral import should_be_ephemeral
 from utils.text import capitalize_words
 from utils.perms import is_mod
@@ -495,25 +502,29 @@ class DeleteTrackView(discord.ui.View):
             if dn:
                 affected.append(dn)
 
-        # delete match + its individual_results
-        mid = self.m["match_id"]
-        await matches.delete_one({"match_id": mid})
-        await individual_results.delete_many({"match_id": mid})
+        # which match are we deleting?
+        mid = int(self.m["match_id"])
+
+        # get current max BEFORE delete
+        pre_max = await get_max_match_id()
+
+        # delete match + its individual_results (single helper)
+        deleted = await delete_match_cascade(mid)
+        if not deleted:
+            await interaction.edit_original_response(content=f"❌ Track {mid} not found (nothing deleted).")
+            return
 
         # recompute players lists for affected decks
-        # if affected:
-        #     await recompute_deck_players_for(decks, individual_results, affected)
-        #     await set_counter_to_max_match_id()
-            
         try:
             if affected:
-                await recompute_deck_players_for(decks, individual_results, list(set(affected)))
+                uniq = sorted(set(affected))
+                await recompute_deck_players_for(decks, individual_results, uniq)
         except Exception as e:
             log.warning("recompute_deck_players_for failed after deletion: %s", e)
-            
-        await set_counter_to_max_match_id()
 
-
+        # Only adjust counter if this was the current max match_id
+        if mid == pre_max:
+            await set_counter_to_max_match_id()
 
         # feedback
         emb = discord.Embed(
@@ -527,6 +538,7 @@ class DeleteTrackView(discord.ui.View):
         self._disable_all()
         self._done = True
         await interaction.edit_original_response(embed=emb, view=self)
+
 
     @discord.ui.button(label="✖️ Cancel", style=discord.ButtonStyle.secondary)
     async def cancel(self, _, interaction: discord.Interaction):
