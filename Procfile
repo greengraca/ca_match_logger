@@ -1,1 +1,1 @@
-worker: python caMatchLogger.py
+worker: python main.py
