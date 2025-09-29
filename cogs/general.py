@@ -267,7 +267,7 @@ class General(commands.Cog):
     @slash_command(
         guild_ids=[GUILD_ID],
         name="generalstats",
-        description="Show global seat win% pre-/post-ban (cutover: 2024-09-24 UTC).",
+        description="Show global seat win% pre-/post-ban",
     )
     async def generalstats(self, ctx: discord.ApplicationContext):
         eph = should_be_ephemeral(ctx)

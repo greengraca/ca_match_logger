@@ -8,6 +8,7 @@ from discord.commands import slash_command, Option
 from config import GUILD_ID, IS_DEV
 from db import matches, individual_results, decks as decks_col, counters as counters_col
 from utils.text import capitalize_words
+from pymongo import ReturnDocument
 
 
 # Top-level autocomplete to be used inside annotations
@@ -22,10 +23,19 @@ class Matches(commands.Cog):
     def __init__(self, bot): 
         self.bot = bot
 
+    # async def get_next_match_id(self) -> int:
+    #     await counters_col.find_one_and_update({"_id": "match_id"}, {"$inc": {"sequence_value": 1}}, upsert=True)
+    #     doc = await counters_col.find_one({"_id": "match_id"})
+    #     return doc["sequence_value"] if doc else 1
+    
     async def get_next_match_id(self) -> int:
-        await counters_col.find_one_and_update({"_id": "match_id"}, {"$inc": {"sequence_value": 1}}, upsert=True)
-        doc = await counters_col.find_one({"_id": "match_id"})
-        return doc["sequence_value"] if doc else 1
+        doc = await counters_col.find_one_and_update(
+            {"_id": "match_id"},
+            {"$inc": {"sequence_value": 1}},
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return int(doc["sequence_value"])
 
     async def deck_exists(self, name: str) -> bool:
         return await decks_col.find_one({"name": name}) is not None

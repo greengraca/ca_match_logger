@@ -27,6 +27,7 @@ bot.load_extension("cogs.leaderboard")
 bot.load_extension("cogs.funstuff")
 bot.load_extension("cogs.admin")
 bot.load_extension("cogs.general")
+bot.load_extension("cogs.events")
 bot.load_extension("timerCog")
 
 _did_indexes = False  # <-- optional one-time guard

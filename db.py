@@ -18,6 +18,8 @@ decks = db.decks
 matches = db.matches
 counters = db.counters
 individual_results = db.individual_results
+event_registrations = db.event_registrations
+
 
 async def ping():
     """Check MongoDB connectivity."""
@@ -39,22 +41,29 @@ async def ensure_indexes():
     await decks.create_indexes([
         IndexModel([("name", ASCENDING)], unique=True, name="uniq_deck_name"),
     ])
+    
+    await event_registrations.create_indexes([
+        IndexModel([("event_id", ASCENDING), ("user_id", ASCENDING)], unique=True, name="uniq_event_user"),
+        IndexModel([("event_id", ASCENDING)], name="by_event"),
+    ])
 
 async def set_counter_to_max_match_id():
-    doc = await matches.find_one(sort=[("match_id", DESCENDING)], projection={"match_id": 1})
-    new_seq = int(doc["match_id"]) if doc and doc.get("match_id") is not None else 0
-    await counters.update_one({"_id": "match_id"}, {"$set": {"sequence_value": new_seq}}, upsert=True)
-
-async def dec_counter_if_latest(deleted_match_id: int):
     """
-    Decrement the counter only if the deleted match was the latest issued ID.
-    This preserves monotonic IDs and avoids collisions.
+    Set counters.match_id.sequence_value to max(match_id) from `matches`.
+    Lowers the counter only if it's currently greater than that max.
+    If the doc doesn't exist, upsert it with the computed value.
     """
-    try:
-        deleted = int(deleted_match_id)
-    except Exception:
-        return
-    await counters.update_one(
-        {"_id": "match_id", "sequence_value": deleted},
-        {"$inc": {"sequence_value": -1}}
+    doc = await matches.find_one(
+        sort=[("match_id", -1)],
+        projection={"_id": 0, "match_id": 1}
     )
+    max_existing = int(doc["match_id"]) if doc and doc.get("match_id") is not None else 0
+
+    # Only lower if the counter is above max_existing.
+    # The filter prevents moving backwards if another process already advanced it.
+    await counters.update_one(
+        {"_id": "match_id", "sequence_value": {"$gt": max_existing}},
+        {"$set": {"sequence_value": max_existing}},
+        upsert=True,
+    )
+

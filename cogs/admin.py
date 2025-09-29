@@ -7,7 +7,7 @@ from discord.commands import slash_command, Option
 from rapidfuzz import fuzz, process
 
 from config import GUILD_ID, IS_DEV
-from db import decks, matches, individual_results
+from db import decks, matches, individual_results, set_counter_to_max_match_id  
 from utils.ephemeral import should_be_ephemeral
 from utils.text import capitalize_words
 from utils.perms import is_mod
@@ -501,8 +501,19 @@ class DeleteTrackView(discord.ui.View):
         await individual_results.delete_many({"match_id": mid})
 
         # recompute players lists for affected decks
-        if affected:
-            await recompute_deck_players_for(decks, individual_results, affected)
+        # if affected:
+        #     await recompute_deck_players_for(decks, individual_results, affected)
+        #     await set_counter_to_max_match_id()
+            
+        try:
+            if affected:
+                await recompute_deck_players_for(decks, individual_results, list(set(affected)))
+        except Exception as e:
+            log.warning("recompute_deck_players_for failed after deletion: %s", e)
+            
+        await set_counter_to_max_match_id()
+
+
 
         # feedback
         emb = discord.Embed(
