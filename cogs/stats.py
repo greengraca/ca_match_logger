@@ -312,42 +312,56 @@ class Stats(commands.Cog):
 
 
         # If filtering to one deck: keep your existing dump behavior
-        if 'games' in stats:
-            games = stats['games']
-            n = len(games)
-            if n == 0:
-                embed.description += f"\n\n🗃 0 games found with deck '{fmt_name}'."
+        if individual_deck:
+            games = stats.get("games", [])
+            if not games:
+                embed.description += f"\n\n🗃 No games found with deck '{fmt_name}'."
                 await ctx.respond(embed=embed, ephemeral=eph)
                 return
 
-            if n <= 5:
-                dump = "\n**📜 Game Details (≤5 games):**\n"
-                for g in games:
-                    date = f"{g['date'].strftime('%b')} {g['date'].day}, {g['date'].year}"
-                    dump += f"**Game ID**: `{g['id']}` - `{date}`\n"
-                    for i, p in enumerate(g['players'], start=1):
-                        name = p['deck_name']; star = "🏆" if p['winner'] else ""
-                        bold = f"**{name}**" if name.lower() == fmt_name.lower() else name
-                        dump += f"Seat {i}: {bold} {star}\n"
-                    dump += "\n"
-                embed.description += "\n" + dump
-                await ctx.respond(embed=embed, ephemeral=eph)
-                return
+            # add a hint + button
+            embed.description += (
+                f"\n\n🗃 **{len(games)} games** found with **{fmt_name}**.\n"
+                f"Press **See full dump** to view details."
+            )
 
-            # paginate (assuming you still have paginate_text & PaginatorView)
-            entries = []
-            for g in games:
-                d = f"{g['date'].strftime('%b')} {g['date'].day}, {g['date'].year}"
-                t = f"**Game ID**: `{g['id']}` - `{d}`\n"
-                for i, p in enumerate(g['players'], start=1):
-                    name = p['deck_name']; star = "🏆" if p['winner'] else ""
-                    t += f"Seat {i}: {name} {star}\n"
-                entries.append(t.strip())
+            class SeeDumpView(discord.ui.View):
+                def __init__(self, author: discord.Member, games_list: list[dict], target_deck: str):
+                    super().__init__(timeout=60)
+                    self.author = author
+                    self.games = games_list
+                    self.target = (target_deck or "").lower()
 
-            pages = paginate_text(entries)
-            first = discord.Embed(title=f"📜 Game Dump (Page 1/{len(pages)})", description=pages[0], color=0x00FFCC)
-            view = PaginatorView(author=ctx.author, pages=pages)
-            await ctx.respond(embed=first, view=view, ephemeral=True)
+                def _entries(self) -> list[str]:
+                    out: list[str] = []
+                    for g in self.games:
+                        d = g["date"]
+                        ds = f"{d.strftime('%b')} {d.day}, {d.year}"
+                        txt = f"**Game ID**: `{g['id']}` - `{ds}`\n"
+                        for i, p in enumerate(g["players"], start=1):
+                            name = p.get("deck_name", "Unknown")
+                            bold = f"**{name}**" if name.lower() == self.target else name
+                            star = "🏆" if p.get("winner") else ""
+                            txt += f"Seat {i}: {bold} {star}\n"
+                        out.append(txt.strip())
+                    return out
+
+                @discord.ui.button(label="📜 See full dump", style=discord.ButtonStyle.primary)
+                async def see_dump(self, _btn: discord.ui.Button, interaction: discord.Interaction):
+                    if interaction.user.id != self.author.id:
+                        await interaction.response.send_message("This button isn’t for you 👀", ephemeral=True)
+                        return
+                    pages = paginate_text(self._entries())
+                    first = discord.Embed(
+                        title=f"📜 Game Dump (Page 1/{len(pages)})",
+                        description=pages[0],
+                        color=0x00FFCC,
+                    )
+                    view = PaginatorView(author=self.author, pages=pages)
+                    await interaction.response.send_message(embed=first, view=view, ephemeral=True)
+
+            view = SeeDumpView(author=ctx.author, games_list=games, target_deck=individual_deck)
+            await ctx.respond(embed=embed, view=view, ephemeral=eph)
             return
 
         await ctx.respond(embed=embed, ephemeral=eph)
