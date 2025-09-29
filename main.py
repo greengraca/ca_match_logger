@@ -3,12 +3,6 @@ import logging, discord
 from config import DISCORD_BOT_TOKEN, LOG_LEVEL, GUILD_ID, IS_DEV
 from db import ping, ensure_indexes  
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.messages = True
-intents.guilds = True
-intents.reactions = True
-intents.members = True
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -16,7 +10,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("ca_match_logger")
 
-# 👇 this registers commands ONLY in your guild automatically
+# --- Load Opus defensively ---
+try:
+    if not discord.opus.is_loaded():
+        for cand in ("libopus.so.0", "libopus", "opus"):
+            try:
+                discord.opus.load_opus(cand)
+                log.info("Loaded Opus: %s", cand)
+                break
+            except OSError:
+                continue
+        else:
+            log.warning("Opus library not found; voice will NOT work.")
+except Exception as e:
+    log.warning("Opus init error: %s", e)
+    
+intents = discord.Intents.default()
+intents.message_content = True
+intents.messages = True
+intents.guilds = True
+intents.reactions = True
+intents.members = True
+
 bot = discord.Bot(intents=intents, debug_guilds=[GUILD_ID])
 
 # load cogs
