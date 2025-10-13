@@ -250,7 +250,8 @@ class TimerCog(commands.Cog):
 
                 # schedule messages / audio
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
+                # turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
+                turns_msg = f"Time is over. You have 15 minutes to reach a conclusion. Good luck ! - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
                     "durations": {
@@ -285,7 +286,8 @@ class TimerCog(commands.Cog):
                 self.timer_messages[timer_id] = (sent.channel.id, sent.id)
 
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
+                # turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
+                turns_msg = f"Time is over. You have 15 minutes to reach a conclusion. Good luck ! - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
                     "durations": {
