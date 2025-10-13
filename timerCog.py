@@ -215,8 +215,8 @@ class TimerCog(commands.Cog):
 
         voice_channel = ctx.author.voice.channel
 
-        minutes = 80
-        extra_time_for_turns = 30
+        minutes = 75
+        extra_time_for_turns = 15
         finals_game_probability = 0.15
         swiss_have_to_win_probability = 0.35
         rand_val = random.random()
@@ -250,7 +250,7 @@ class TimerCog(commands.Cog):
 
                 # schedule messages / audio
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 30 minutes to do so - <t:{ts(turns_time)}:R>."
+                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
                     "durations": {
@@ -261,15 +261,16 @@ class TimerCog(commands.Cog):
                     "ctx": ctx,
                     "voice_channel_id": voice_channel.id,
                     "messages": {"turns": turns_msg, "final": "If no one won until now, the game is a draw. Well Played.", "win_and_in": True},
-                    "audio": {"turns": "./timer/ap30minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
+                    "audio": {"turns": "./timer/ap15minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
                 }
 
                 # start sound (join → play → leave)
-                await self._play(ctx.guild, "./timer/swiss80.mp3", channel_id=voice_channel.id, leave_after=True)
+                # await self._play(ctx.guild, "./timer/swiss80.mp3", channel_id=voice_channel.id, leave_after=True)
+                await self._play(ctx.guild, "./timer/timer75.mp3", channel_id=voice_channel.id, leave_after=True)
 
                 # tasks
                 self.timer_tasks[timer_id].append(asyncio.create_task(
-                    self.timer_end(ctx, minutes, turns_msg, "./timer/ap30minutes.mp3", timer_id=timer_id, edit=True)
+                    self.timer_end(ctx, minutes, turns_msg, "./timer/ap15minutes.mp3", timer_id=timer_id, edit=True)
                 ))
                 self.timer_tasks[timer_id].append(asyncio.create_task(
                     self.play_voice_file(ctx, "./timer/brasileira10novo.mp3", (minutes - 10) * 60, timer_id=timer_id)
@@ -284,7 +285,7 @@ class TimerCog(commands.Cog):
                 self.timer_messages[timer_id] = (sent.channel.id, sent.id)
 
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 30 minutes to do so - <t:{ts(turns_time)}:R>."
+                turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
                     "durations": {
@@ -295,7 +296,7 @@ class TimerCog(commands.Cog):
                     "ctx": ctx,
                     "voice_channel_id": voice_channel.id,
                     "messages": {"turns": turns_msg, "final": "If no one won until now, the game is a draw. Well Played."},
-                    "audio": {"turns": "./timer/ap30minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
+                    "audio": {"turns": "./timer/ap15minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
                 }
 
                 # start sound (join → play → leave)
@@ -303,7 +304,7 @@ class TimerCog(commands.Cog):
 
                 # tasks
                 self.timer_tasks[timer_id].append(asyncio.create_task(
-                    self.timer_end(ctx, minutes, turns_msg, "./timer/ap30minutes.mp3", timer_id=timer_id, edit=True)
+                    self.timer_end(ctx, minutes, turns_msg, "./timer/ap15minutes.mp3", timer_id=timer_id, edit=True)
                 ))
                 self.timer_tasks[timer_id].append(asyncio.create_task(
                     self.play_voice_file(ctx, "./timer/brasileira10novo.mp3", (minutes - 10) * 60, timer_id=timer_id)
