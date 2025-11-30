@@ -22,7 +22,7 @@ def make_timer_id(voice_channel_id: int, seq: int) -> str:
     return f"{voice_channel_id}_{seq}"
 
 
-# --- voice constants/helpers (NEW) -------------------------------------------
+# --- voice constants/helpers -------------------------------------------------
 VOICE_CONNECT_TIMEOUT = 10.0
 VOICE_PLAY_START_TIMEOUT = 6.0   # seconds to wait for is_playing() to flip True
 
@@ -30,14 +30,13 @@ def _same_channel(vc: discord.VoiceClient | None, ch: discord.VoiceChannel | Non
     return bool(vc and ch and vc.channel and ch and vc.channel.id == ch.id)
 
 def _ffmpeg_src(path: str) -> discord.FFmpegPCMAudio:
-    # Safer defaults for hosting; no stdin; no video.
     return discord.FFmpegPCMAudio(path, before_options="-nostdin", options="-vn")
 
 
 class TimerCog(commands.Cog):
     """
-    Manages a single timer per voice channel. The bot will JOIN to play audio
-    and immediately LEAVE after playback each time (start, -10m, turns, final).
+    Manages a single timer per voice channel. The bot joins to play audio
+    and leaves after playback each time (start, -10m, turns, final).
     """
 
     def __init__(self, bot: commands.Bot):
@@ -48,9 +47,7 @@ class TimerCog(commands.Cog):
         self.voice_channel_users: dict[str, list[str] | str] = {}
         self.timer_messages: dict[str, tuple[int, int]] = {}
         self.timer_tasks: dict[str, list[asyncio.Task]] = {}
-
-        # NEW: per-guild voice op locks to avoid concurrent connect/play races
-        self._voice_locks: dict[int, asyncio.Lock] = {}
+        self._voice_locks: dict[int, asyncio.Lock] = {}  # per-guild
 
     # ---------------- voice utils ----------------
 
@@ -59,6 +56,37 @@ class TimerCog(commands.Cog):
         if not lock:
             lock = self._voice_locks[gid] = asyncio.Lock()
         return lock
+
+    async def _hard_reset_voice(self, guild: discord.Guild):
+        """Forcefully clear any stuck voice state for the guild."""
+        vc = guild.voice_client
+        with contextlib.suppress(Exception):
+            if vc:
+                await vc.disconnect(force=True)
+        # Explicitly tell the guild we're not in voice anymore
+        with contextlib.suppress(Exception):
+            await guild.change_voice_state(channel=None)
+        await asyncio.sleep(0.25)
+
+    async def _ensure_connected(
+        self,
+        guild: discord.Guild,
+        target_ch: Optional[discord.VoiceChannel],
+    ) -> Optional[discord.VoiceClient]:
+        """Connect or move to target channel; return a connected VoiceClient."""
+        if not target_ch:
+            return None
+
+        vc = guild.voice_client
+        # If connected but wrong channel -> move
+        if vc and vc.is_connected():
+            if not _same_channel(vc, target_ch):
+                with contextlib.suppress(Exception):
+                    await vc.move_to(target_ch)
+            return guild.voice_client
+
+        # Not connected or stale -> connect
+        return await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT, self_deaf=True)
 
     async def _play(
         self,
@@ -72,66 +100,67 @@ class TimerCog(commands.Cog):
         Play a file in the given guild. If not connected, connect (or move) to channel_id.
         Always disconnect after playback if leave_after=True.
 
-        CHANGES:
-        - Serialize per-guild with a lock (prevents 'Already connected...' races)
-        - Move to target channel if already connected somewhere else
-        - Wait for playback to actually start, then drain; bail if it never starts
+        Adds a hard-reset + single retry for voice 4006 / invalid session cases.
         """
         if not source_path or not guild:
             return
 
         gid = guild.id
         async with self._vlock(gid):
-            vc = guild.voice_client
+            # Resolve target channel
+            target_ch = None
+            if channel_id is not None:
+                ch = guild.get_channel(channel_id)
+                target_ch = ch if isinstance(ch, discord.VoiceChannel) else None
 
-            try:
-                # Ensure we are in the right channel
-                target_ch = None
-                if channel_id is not None:
-                    ch = guild.get_channel(channel_id)
-                    target_ch = ch if isinstance(ch, discord.VoiceChannel) else None
-
-                if vc and vc.is_connected():
-                    if target_ch and not _same_channel(vc, target_ch):
-                        # Move instead of a second connect()
-                        with contextlib.suppress(Exception):
-                            await vc.move_to(target_ch)
-                else:
-                    if not target_ch:
-                        # No connection and no target channel to connect to
-                        return
-                    vc = await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT)
-
+            async def _connect_and_play() -> bool:
+                """Return True if play started and finished; False if it never started."""
+                vc = await self._ensure_connected(guild, target_ch)
                 if not vc:
-                    return
+                    return False
 
-                # Stop any current playback
                 if vc.is_playing():
                     vc.stop()
 
-                # Start playing
                 vc.play(_ffmpeg_src(source_path))
 
-                # Wait for playback to actually start (avoid hanging forever)
+                # Wait for playback to actually start
                 waited = 0.0
                 while not vc.is_playing() and waited < VOICE_PLAY_START_TIMEOUT:
                     await asyncio.sleep(0.1)
                     waited += 0.1
 
                 if not vc.is_playing():
-                    # playback never started; nothing else to do
-                    return
+                    return False
 
-                # Drain until done
+                # Drain
                 while vc.is_playing():
                     await asyncio.sleep(0.5)
 
-            except Exception as e:
-                print(f"[voice] play error: {e}")
+                return True
 
-            finally:
-                # Always leave after playing so the bot doesn't sit in VC
-                if leave_after and vc and vc.is_connected():
+            played = False
+            try:
+                played = await _connect_and_play()
+            except discord.errors.ConnectionClosed as e:
+                # Voice WS closed (e.g., 4006). We'll hard reset and retry once.
+                print(f"[voice] WS closed ({getattr(e, 'code', '???')}). Will hard reset and retry once.")
+            except Exception as e:
+                # Other unexpected connect/play exceptions -> try hard reset once too
+                print(f"[voice] play error (first attempt): {e}")
+
+            if not played:
+                # Hard reset & one retry
+                await self._hard_reset_voice(guild)
+                try:
+                    played = await _connect_and_play()
+                except Exception as e:
+                    print(f"[voice] play error (after reset): {e}")
+
+            # Always leave after playing so the bot doesn't sit in VC
+            if leave_after:
+                vc = guild.voice_client
+                if vc and vc.is_connected():
                     with contextlib.suppress(Exception):
                         await vc.disconnect(force=True)
 
@@ -148,14 +177,12 @@ class TimerCog(commands.Cog):
         edit: bool = False,
         delete_after: Optional[float] = None,  # minutes
     ):
-        """Waits `minutes`, then edits/sends message, plays audio, and optionally deletes after."""
         await asyncio.sleep(max(0.0, minutes) * 60)
 
         channel = ctx.channel
         msg_obj: Optional[discord.Message] = None
 
         if edit and timer_id and timer_id in self.timer_messages:
-            # fetch stored message and edit it
             ch_id, m_id = self.timer_messages[timer_id]
             ch = self.bot.get_channel(ch_id) or channel
             try:
@@ -164,7 +191,6 @@ class TimerCog(commands.Cog):
             except Exception as e:
                 print(f"[timer_end] Failed to edit message: {e}")
         else:
-            # send new message
             try:
                 msg_obj = await channel.send(message)
                 if timer_id:
@@ -181,7 +207,6 @@ class TimerCog(commands.Cog):
 
         await self._play(ctx.guild, voice_file_path, channel_id=vcid, leave_after=True)
 
-        # optional deletion after N minutes
         if delete_after is not None and msg_obj is not None:
             await asyncio.sleep(max(0.0, delete_after) * 60)
             with contextlib.suppress(Exception):
@@ -195,7 +220,6 @@ class TimerCog(commands.Cog):
         *,
         timer_id: Optional[str] = None,
     ):
-        """Plays `voice_file_path` after `delay_seconds` in the stored VC for the timer (or user's current)."""
         await asyncio.sleep(max(0.0, delay_seconds))
 
         vcid = None
@@ -209,7 +233,6 @@ class TimerCog(commands.Cog):
     # ---------------- utilities ----------------
 
     def is_user_in_timer(self, user_id: int | str, timer_id: str) -> bool:
-        """Check if a user is part of an active timer."""
         arr = self.voice_channel_users.get(timer_id)
         if not isinstance(arr, list):
             return False
@@ -226,11 +249,9 @@ class TimerCog(commands.Cog):
         self.timer_tasks[timer_id] = []
 
     async def set_timer_stopped(self, timer_id: str, reason: str = "track"):
-        """Stop a timer, cancel tasks, and mark message."""
         if timer_id not in self.voice_channel_users:
             return
 
-        # mark stopped + clear state
         self.voice_channel_users[timer_id] = "stopped"
         self.active_timers.pop(timer_id, None)
         self.paused_timers.pop(timer_id, None)
@@ -245,7 +266,6 @@ class TimerCog(commands.Cog):
                 try:
                     msg = await ch.fetch_message(m_id)
                     await msg.edit(content=f"Timer was stopped {reason_text}")
-                    # delete after 60s
                     async def _del(m: discord.Message):
                         await asyncio.sleep(60)
                         with contextlib.suppress(Exception):
@@ -281,7 +301,6 @@ class TimerCog(commands.Cog):
 
         try:
             if rand_val <= finals_game_probability:
-                # Finals game: no time limit, play finals clip once and leave
                 await ctx.followup.send(
                     "This is a final game with no time limit! You may ID and restart the match in the same positions if you all have time, "
                     "but in the end it has to have a winner. Play accordingly."
@@ -289,7 +308,6 @@ class TimerCog(commands.Cog):
                 await self._play(ctx.guild, "./timer/final.mp3", channel_id=voice_channel.id, leave_after=True)
                 return
 
-            # Swiss WIN&IN vs normal
             end_time = now_utc() + timedelta(minutes=minutes)
             end_ts = ts(end_time)
 
@@ -299,9 +317,7 @@ class TimerCog(commands.Cog):
                 )
                 self.timer_messages[timer_id] = (sent.channel.id, sent.id)
 
-                # schedule messages / audio
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                # turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
                 turns_msg = f"Time is over. You have 15 minutes to reach a conclusion. Good luck ! - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
@@ -316,11 +332,8 @@ class TimerCog(commands.Cog):
                     "audio": {"turns": "./timer/ap15minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
                 }
 
-                # start sound (join → play → leave)
-                # await self._play(ctx.guild, "./timer/swiss80.mp3", channel_id=voice_channel.id, leave_after=True)
                 await self._play(ctx.guild, "./timer/timer75.mp3", channel_id=voice_channel.id, leave_after=True)
 
-                # tasks
                 self.timer_tasks[timer_id].append(asyncio.create_task(
                     self.timer_end(ctx, minutes, turns_msg, "./timer/ap15minutes.mp3", timer_id=timer_id, edit=True)
                 ))
@@ -337,7 +350,6 @@ class TimerCog(commands.Cog):
                 self.timer_messages[timer_id] = (sent.channel.id, sent.id)
 
                 turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                # turns_msg = f"Time is over. The active player should finish his turn and take a maximum of 15 minutes to do so - <t:{ts(turns_time)}:R>."
                 turns_msg = f"Time is over. You have 15 minutes to reach a conclusion. Good luck ! - <t:{ts(turns_time)}:R>."
                 self.active_timers[timer_id] = {
                     "start_time": now_utc(),
@@ -352,10 +364,8 @@ class TimerCog(commands.Cog):
                     "audio": {"turns": "./timer/ap15minutes.mp3", "final": "./timer/ggboyz.mp3", "easter_egg": "./timer/brasileira10novo.mp3"},
                 }
 
-                # start sound (join → play → leave)
                 await self._play(ctx.guild, "./timer/timer80.mp3", channel_id=voice_channel.id, leave_after=True)
 
-                # tasks
                 self.timer_tasks[timer_id].append(asyncio.create_task(
                     self.timer_end(ctx, minutes, turns_msg, "./timer/ap15minutes.mp3", timer_id=timer_id, edit=True)
                 ))
@@ -401,7 +411,6 @@ class TimerCog(commands.Cog):
         seq = self.voice_channel_timers.get(vc_id, 0)
         timer_id = make_timer_id(vc_id, seq)
 
-        # must exist & user must be part of it
         if not self.is_user_in_timer(ctx.author.id, timer_id):
             await ctx.followup.send("You're not part of the current timer.", ephemeral=True)
             return
@@ -409,10 +418,8 @@ class TimerCog(commands.Cog):
             await ctx.followup.send("There's no active timer to pause.", ephemeral=True)
             return
 
-        # cancel running tasks
         await self._cancel_tasks(timer_id)
 
-        # compute remaining
         timer_data = self.active_timers.pop(timer_id)
         elapsed = (now_utc() - timer_data["start_time"]).total_seconds()
         durations = timer_data["durations"]
@@ -422,7 +429,6 @@ class TimerCog(commands.Cog):
             "extra": max(durations["extra"] - elapsed + durations["main"], 0),
         }
 
-        # delete original timer message (if any)
         try:
             ch_id, m_id = self.timer_messages.get(timer_id, (None, None))
             if ch_id and m_id:
@@ -465,13 +471,11 @@ class TimerCog(commands.Cog):
 
         paused = self.paused_timers.pop(timer_id)
 
-        # delete pause message
         pm = paused.get("pause_message")
         if pm:
             with contextlib.suppress(Exception):
                 await pm.delete()
 
-        # restore active state
         self.active_timers[timer_id] = {
             "start_time": now_utc(),
             "durations": paused["remaining"],
@@ -492,7 +496,6 @@ class TimerCog(commands.Cog):
         egg = paused["remaining"]["easter_egg"]
         extra = paused["remaining"]["extra"]
 
-        # schedule again with remaining times
         self.timer_tasks[timer_id].append(asyncio.create_task(
             self.timer_end(old_ctx, main / 60, turns_msg, turns_audio, timer_id=timer_id, edit=True)
         ))
