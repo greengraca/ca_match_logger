@@ -35,8 +35,7 @@ def _ffmpeg_src(path: str) -> discord.FFmpegPCMAudio:
 
 class TimerCog(commands.Cog):
     """
-    Manages a single timer per voice channel. The bot joins to play audio
-    and leaves after playback each time (start, -10m, turns, final).
+    Joins to play audio and leaves after playback each time.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -63,7 +62,6 @@ class TimerCog(commands.Cog):
         with contextlib.suppress(Exception):
             if vc:
                 await vc.disconnect(force=True)
-        # Explicitly tell the guild we're not in voice anymore
         with contextlib.suppress(Exception):
             await guild.change_voice_state(channel=None)
         await asyncio.sleep(0.25)
@@ -83,10 +81,17 @@ class TimerCog(commands.Cog):
             if not _same_channel(vc, target_ch):
                 with contextlib.suppress(Exception):
                     await vc.move_to(target_ch)
+                # best-effort self-deafen after move (if supported)
+                with contextlib.suppress(Exception):
+                    await guild.change_voice_state(channel=target_ch, self_mute=False, self_deaf=True)
             return guild.voice_client
 
-        # Not connected or stale -> connect
-        return await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT, self_deaf=True)
+        # Not connected or stale -> connect (no self_deaf kw here)
+        vc = await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT)
+        # best-effort self-deafen after connect (if supported by this lib)
+        with contextlib.suppress(Exception):
+            await guild.change_voice_state(channel=target_ch, self_mute=False, self_deaf=True)
+        return vc
 
     async def _play(
         self,
@@ -146,7 +151,6 @@ class TimerCog(commands.Cog):
                 # Voice WS closed (e.g., 4006). We'll hard reset and retry once.
                 print(f"[voice] WS closed ({getattr(e, 'code', '???')}). Will hard reset and retry once.")
             except Exception as e:
-                # Other unexpected connect/play exceptions -> try hard reset once too
                 print(f"[voice] play error (first attempt): {e}")
 
             if not played:
