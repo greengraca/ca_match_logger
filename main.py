@@ -32,6 +32,7 @@ intents.messages = True
 intents.guilds = True
 intents.reactions = True
 intents.members = True
+intents.voice_states = True       
 
 bot = discord.Bot(intents=intents, debug_guilds=[GUILD_ID])
 

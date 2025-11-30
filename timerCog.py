@@ -87,7 +87,7 @@ class TimerCog(commands.Cog):
             return guild.voice_client
 
         # Not connected or stale -> connect (no self_deaf kw here)
-        vc = await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT)
+        vc = await target_ch.connect(reconnect=False, timeout=VOICE_CONNECT_TIMEOUT)
         # best-effort self-deafen after connect (if supported by this lib)
         with contextlib.suppress(Exception):
             await guild.change_voice_state(channel=target_ch, self_mute=False, self_deaf=True)
