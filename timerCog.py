@@ -22,6 +22,18 @@ def make_timer_id(voice_channel_id: int, seq: int) -> str:
     return f"{voice_channel_id}_{seq}"
 
 
+# --- voice constants/helpers (NEW) -------------------------------------------
+VOICE_CONNECT_TIMEOUT = 10.0
+VOICE_PLAY_START_TIMEOUT = 6.0   # seconds to wait for is_playing() to flip True
+
+def _same_channel(vc: discord.VoiceClient | None, ch: discord.VoiceChannel | None) -> bool:
+    return bool(vc and ch and vc.channel and ch and vc.channel.id == ch.id)
+
+def _ffmpeg_src(path: str) -> discord.FFmpegPCMAudio:
+    # Safer defaults for hosting; no stdin; no video.
+    return discord.FFmpegPCMAudio(path, before_options="-nostdin", options="-vn")
+
+
 class TimerCog(commands.Cog):
     """
     Manages a single timer per voice channel. The bot will JOIN to play audio
@@ -37,7 +49,16 @@ class TimerCog(commands.Cog):
         self.timer_messages: dict[str, tuple[int, int]] = {}
         self.timer_tasks: dict[str, list[asyncio.Task]] = {}
 
+        # NEW: per-guild voice op locks to avoid concurrent connect/play races
+        self._voice_locks: dict[int, asyncio.Lock] = {}
+
     # ---------------- voice utils ----------------
+
+    def _vlock(self, gid: int) -> asyncio.Lock:
+        lock = self._voice_locks.get(gid)
+        if not lock:
+            lock = self._voice_locks[gid] = asyncio.Lock()
+        return lock
 
     async def _play(
         self,
@@ -48,41 +69,71 @@ class TimerCog(commands.Cog):
         leave_after: bool = True,
     ):
         """
-        Play a file in the given guild. If not connected, connect to channel_id.
+        Play a file in the given guild. If not connected, connect (or move) to channel_id.
         Always disconnect after playback if leave_after=True.
+
+        CHANGES:
+        - Serialize per-guild with a lock (prevents 'Already connected...' races)
+        - Move to target channel if already connected somewhere else
+        - Wait for playback to actually start, then drain; bail if it never starts
         """
-        if not source_path:
+        if not source_path or not guild:
             return
 
-        vc = guild.voice_client
-        created_here = False
+        gid = guild.id
+        async with self._vlock(gid):
+            vc = guild.voice_client
 
-        try:
-            if not vc or not vc.is_connected():
-                if channel_id is None:
-                    # No connection and no target channel to connect to
+            try:
+                # Ensure we are in the right channel
+                target_ch = None
+                if channel_id is not None:
+                    ch = guild.get_channel(channel_id)
+                    target_ch = ch if isinstance(ch, discord.VoiceChannel) else None
+
+                if vc and vc.is_connected():
+                    if target_ch and not _same_channel(vc, target_ch):
+                        # Move instead of a second connect()
+                        with contextlib.suppress(Exception):
+                            await vc.move_to(target_ch)
+                else:
+                    if not target_ch:
+                        # No connection and no target channel to connect to
+                        return
+                    vc = await target_ch.connect(reconnect=True, timeout=VOICE_CONNECT_TIMEOUT)
+
+                if not vc:
                     return
-                ch = guild.get_channel(channel_id)
-                if not isinstance(ch, discord.VoiceChannel):
+
+                # Stop any current playback
+                if vc.is_playing():
+                    vc.stop()
+
+                # Start playing
+                vc.play(_ffmpeg_src(source_path))
+
+                # Wait for playback to actually start (avoid hanging forever)
+                waited = 0.0
+                while not vc.is_playing() and waited < VOICE_PLAY_START_TIMEOUT:
+                    await asyncio.sleep(0.1)
+                    waited += 0.1
+
+                if not vc.is_playing():
+                    # playback never started; nothing else to do
                     return
-                vc = await ch.connect(reconnect=False, timeout=10.0)
-                created_here = True
 
-            if vc.is_playing():
-                vc.stop()
+                # Drain until done
+                while vc.is_playing():
+                    await asyncio.sleep(0.5)
 
-            vc.play(discord.FFmpegPCMAudio(source_path))
-            while vc.is_playing():
-                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[voice] play error: {e}")
 
-        except Exception as e:
-            print(f"[voice] play error: {e}")
-
-        finally:
-            # Always leave after playing so the bot doesn't sit in VC
-            if leave_after and vc and vc.is_connected():
-                with contextlib.suppress(Exception):
-                    await vc.disconnect(force=True)
+            finally:
+                # Always leave after playing so the bot doesn't sit in VC
+                if leave_after and vc and vc.is_connected():
+                    with contextlib.suppress(Exception):
+                        await vc.disconnect(force=True)
 
     # ---------------- core actions ----------------
 
