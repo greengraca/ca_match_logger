@@ -1,15 +1,52 @@
 # main.py
-import logging
-import discord
+import logging, os, discord
+print(f"Discord version: {discord.__version__}")
+print(f"Discord module path: {discord.__file__}")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+log = logging.getLogger("ca_match_logger")
+
+
+def load_opus() -> bool:
+    if discord.opus.is_loaded():
+        log.info("Opus already loaded")
+        return True
+
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    candidates = [
+        # Windows (put libopus.dll next to main.py)
+        "libopus.dll", "libopus-0.dll", "opus.dll",
+        os.path.join(here, "libopus.dll"),
+        os.path.join(here, "libopus-0.dll"),
+        os.path.join(here, "opus.dll"),
+
+        # Linux (Heroku will provide these via Aptfile)
+        "libopus.so.0", "libopus.so",
+
+        # macOS
+        "libopus.dylib",
+    ]
+
+    for path in candidates:
+        try:
+            discord.opus.load_opus(path)
+            log.info("Loaded Opus from %s", path)
+            return True
+        except Exception:
+            continue
+
+    log.warning("Opus library not found; voice will NOT work.")
+    return False
+
+load_opus()
 
 from config import DISCORD_BOT_TOKEN, LOG_LEVEL, GUILD_ID, IS_DEV
 from db import ping, ensure_indexes
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-)
-log = logging.getLogger("ca_match_logger")
 
 # --- Load Opus defensively (voice) ---
 try:
@@ -52,6 +89,7 @@ _did_indexes = False
 
 @bot.event
 async def on_ready():
+    print(f"[boot] voice_states intent on? {bot.intents.voice_states}")
     global _did_indexes
     try:
         await ping()
@@ -70,4 +108,9 @@ async def on_ready():
     await bot.change_presence(activity=discord.Game("(DEV) CA Match Logger" if IS_DEV else "CA Match Logger"))
     log.info("Logged in as %s (%s)", bot.user, bot.user.id)
 
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.id == bot.user.id:
+        print(f"[voice] self state: {getattr(before.channel,'id',None)} -> {getattr(after.channel,'id',None)}")
+        
 bot.run(DISCORD_BOT_TOKEN)
