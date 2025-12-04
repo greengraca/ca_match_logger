@@ -1,5 +1,6 @@
 # timerCog.py
 import os
+import imageio_ffmpeg  # add this import
 import asyncio
 import contextlib
 import random
@@ -11,6 +12,13 @@ from discord.ext import commands
 
 from config import GUILD_ID  # env-driven guild
 
+
+try:
+    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+    print(f"[voice] Using ffmpeg from imageio-ffmpeg: {FFMPEG_EXE}")
+except Exception as e:
+    FFMPEG_EXE = "ffmpeg"
+    print(f"[voice] Failed to get imageio-ffmpeg binary, falling back to 'ffmpeg': {e}")
 
 # --- env-driven timing -------------------------------------------------------
 
@@ -74,9 +82,19 @@ def _voice_prereqs_ok() -> bool:
     return True
 
 
+# def _ffmpeg_src(path: str) -> discord.AudioSource:
+#     # Use Opus-encoded output from ffmpeg; avoids PCM encoding path.
+#     return discord.FFmpegOpusAudio(path, before_options="-nostdin", options="-vn")
+
 def _ffmpeg_src(path: str) -> discord.AudioSource:
     # Use Opus-encoded output from ffmpeg; avoids PCM encoding path.
-    return discord.FFmpegOpusAudio(path, before_options="-nostdin", options="-vn")
+    return discord.FFmpegOpusAudio(
+        path,
+        before_options="-nostdin",
+        options="-vn",
+        executable=FFMPEG_EXE,  # 👈 key change
+    )
+
 
 
 # --- Cog ---------------------------------------------------------------------
@@ -416,7 +434,7 @@ class TimerCog(commands.Cog):
 
     #     try:
     #         print("[vtest] Playing timer/brasileira10novo.mp3")
-    #         vc.play(discord.FFmpegPCMAudio("timer/brasileira10novo.mp3"))
+    #         vc.play(discord.FFmpegPCMAudio("timer/brasileira10novo.mp3", executable=FFMPEG_EXE))
     #         await asyncio.sleep(5)
     #     except Exception as e:
     #         print(f"[vtest error] Playback failed: {type(e).__name__}: {e}")
