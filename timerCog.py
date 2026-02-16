@@ -29,10 +29,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 # Main round duration in minutes
-TIMER_MINUTES: float = _env_float("TIMER_MINUTES", 80.0)
+TIMER_MINUTES: float = _env_float("TIMER_MINUTES", 75.0)
 
 # Extra time for turns in minutes
-EXTRA_TURNS_MINUTES: float = _env_float("EXTRA_TURNS_MINUTES", 20.0)
+EXTRA_TURNS_MINUTES: float = _env_float("EXTRA_TURNS_MINUTES", 15.0)
 
 # Probability this is a finals game (no time limit)
 FINALS_GAME_PROBABILITY: float = _env_float("FINALS_GAME_PROBABILITY", 0.15)
@@ -543,7 +543,7 @@ class TimerCog(commands.Cog):
                         "win_and_in": True,
                     },
                     "audio": {
-                        "turns": "./timer/ap20minutes.mp3",
+                        "turns": "./timer/ap15minutes.mp3",
                         "final": "./timer/ggboyz.mp3",
                         "easter_egg": "./timer/brasileira10novo.mp3",
                     },
@@ -552,7 +552,7 @@ class TimerCog(commands.Cog):
                 # intro audio (WIN & IN) – you can swap to timer75 if you want
                 await self._play(
                     ctx.guild,
-                    "./timer/timer80.mp3",
+                    "./timer/timer75.mp3",
                     channel_id=voice_channel.id,
                     leave_after=True,
                 )
@@ -564,7 +564,7 @@ class TimerCog(commands.Cog):
                             ctx,
                             minutes,
                             turns_msg,
-                            "./timer/ap20minutes.mp3",
+                            "./timer/ap15minutes.mp3",
                             timer_id=timer_id,
                             edit=True,
                         )
@@ -629,7 +629,7 @@ class TimerCog(commands.Cog):
                         "final": "If no one won until now, the game is a draw. Well Played.",
                     },
                     "audio": {
-                        "turns": "./timer/ap20minutes.mp3",
+                        "turns": "./timer/ap15minutes.mp3",
                         "final": "./timer/ggboyz.mp3",
                         "easter_egg": "./timer/brasileira10novo.mp3",
                     },
@@ -638,7 +638,7 @@ class TimerCog(commands.Cog):
                 # intro audio (regular swiss)
                 await self._play(
                     ctx.guild,
-                    "./timer/timer80.mp3",
+                    "./timer/timer75.mp3",
                     channel_id=voice_channel.id,
                     leave_after=True,
                 )
@@ -649,7 +649,7 @@ class TimerCog(commands.Cog):
                             ctx,
                             minutes,
                             turns_msg,
-                            "./timer/ap20minutes.mp3",
+                            "./timer/ap15minutes.mp3",
                             timer_id=timer_id,
                             edit=True,
                         )
