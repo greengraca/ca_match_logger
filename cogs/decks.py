@@ -8,8 +8,9 @@ from rapidfuzz import fuzz
 
 from config import GUILD_ID, IS_DEV
 from db import decks as decks_col
-from utils.text import capitalize_words, format_deck_name
+from utils.text import capitalize_words, format_deck_name, paginate_text, MAX_EMBED_CHARS
 from utils.ephemeral import should_be_ephemeral
+from utils.views import PaginatorView
 
 
 
@@ -33,8 +34,23 @@ class Decks(commands.Cog):
     async def list_decks(self, ctx: discord.ApplicationContext):
         cursor = decks_col.find({}, {"name": 1, "_id": 0})
         names = sorted([capitalize_words(d["name"]) async for d in cursor], key=str.lower)
-        embed = discord.Embed(title="Decks in the database", description="\n".join(names))
-        await ctx.respond(embed=embed,ephemeral=should_be_ephemeral(ctx))
+        eph = should_be_ephemeral(ctx)
+
+        if not names:
+            await ctx.respond(embed=discord.Embed(title="Decks in the database", description="_No decks found._"), ephemeral=eph)
+            return
+
+        # Discord embed description hard-limit is 4096 chars.
+        pages = paginate_text(names, header="", limit=MAX_EMBED_CHARS)
+
+        if len(pages) == 1:
+            await ctx.respond(embed=discord.Embed(title="Decks in the database", description=pages[0]), ephemeral=eph)
+            return
+
+        title = "Decks in the database"
+        first = discord.Embed(title=f"{title} (Page 1/{len(pages)})", description=pages[0])
+        view = PaginatorView(author=ctx.author, pages=pages, title=title)
+        await ctx.respond(embed=first, view=view, ephemeral=eph)
 
     @slash_command(guild_ids=[GUILD_ID], name="newdeck", description="Add a new deck.")
     async def new_deck(
