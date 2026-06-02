@@ -56,3 +56,60 @@ def pick_phase(remaining_main: float, remaining_total: float, phase_override=Non
     if remaining_total > 0:
         return "extra"
     return "draw"
+
+
+def build_timer_embed(
+    vc_name: str,
+    phase: str,                # "running" | "extra" | "draw" | "paused"
+    main_total: float,
+    extra_total: float,
+    remaining_main: float,
+    remaining_total: float,
+    end_ts_main: int,
+    end_ts_final: int,
+    *,
+    win_and_in: bool = False,
+    title_prefix: str = "",
+) -> discord.Embed:
+    """Phase-colored timer embed with progress bar. Pure, no side effects."""
+    color = PHASE_COLORS.get(phase, PHASE_COLORS["running"])
+    titles = {
+        "running": f"⏱️ {vc_name} — Timer Running",
+        "extra":   f"⏱️ {vc_name} — Extra Time!",
+        "draw":    f"⏱️ {vc_name} — Game Over",
+        "paused":  f"⏸️ {vc_name} — Paused",
+    }
+    embed = discord.Embed(title=f"{title_prefix}{titles.get(phase, '⏱️ ' + vc_name)}", color=color)
+    bar = build_progress_bar(main_total, extra_total, remaining_main, remaining_total)
+    win_line = "🏆 **WIN & IN** — you must win to make the cut!\n" if win_and_in else ""
+
+    if phase == "running":
+        m, s = int(remaining_main // 60), int(remaining_main % 60)
+        embed.add_field(name="Main Time", value=f"**{m}:{s:02d}** remaining", inline=False)
+        embed.description = (
+            f"{win_line}```{bar}```"
+            f"\nMain time ends <t:{end_ts_main}:R> · Draw <t:{end_ts_final}:R>"
+        )
+        embed.set_footer(text="/pausetimer to pause · /endtimer to stop")
+    elif phase == "extra":
+        m, s = int(remaining_total // 60), int(remaining_total % 60)
+        extra_minutes = int(extra_total / 60)
+        embed.add_field(name="Extra Time", value=f"**{m}:{s:02d}** remaining", inline=False)
+        embed.description = (
+            f"{win_line}Time is over. You have **{extra_minutes} minutes** to finish "
+            f"the active player's turn. Good luck!\n```{bar}```"
+            f"\nDraw <t:{end_ts_final}:R>"
+        )
+        embed.set_footer(text="/pausetimer to pause · /endtimer to stop")
+    elif phase == "draw":
+        embed.description = f"```{bar}```\nIf no one won until now, the game is a draw. Well Played."
+    elif phase == "paused":
+        if remaining_main > 0:
+            m, s = int(remaining_main // 60), int(remaining_main % 60)
+            embed.add_field(name="Main Time", value=f"**{m}:{s:02d}** remaining", inline=False)
+        else:
+            m, s = int(remaining_total // 60), int(remaining_total % 60)
+            embed.add_field(name="Extra Time", value=f"**{m}:{s:02d}** remaining", inline=False)
+        embed.description = f"```{bar}```\nUse `/resumetimer` to continue."
+
+    return embed
