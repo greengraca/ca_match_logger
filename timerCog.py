@@ -10,7 +10,8 @@ from typing import Optional
 import discord
 from discord.ext import commands
 
-from config import GUILD_ID  # env-driven guild
+from config import GUILD_ID, IS_DEV  # env-driven guild + dev flag
+from utils.timer_embed import PHASE_COLORS, build_timer_embed, pick_phase
 
 
 try:
@@ -44,6 +45,17 @@ SWISS_HAVE_TO_WIN_PROBABILITY: float = _env_float(
 
 # Brasileira should always play N minutes before main time ends
 BRASILEIRA_OFFSET_MINUTES: float = 10.0  # for testing
+
+# How often the live embed re-edits (minutes). At width 30 over a 90-min game each
+# bar cell ~= 3 min, so a 3-min tick advances ~one cell per update.
+TIMER_UPDATE_INTERVAL_MINUTES: float = _env_float("TIMER_UPDATE_INTERVAL_MINUTES", 3.0)
+
+# Audio file paths (override via env if needed)
+INTRO_AUDIO: str      = os.getenv("TIMER_INTRO_AUDIO", "./timer/timer75.mp3")
+TURNS_AUDIO: str      = os.getenv("TIMER_TURNS_AUDIO", "./timer/ap15minutes.mp3")
+EASTER_EGG_AUDIO: str = os.getenv("TIMER_EGG_AUDIO", "./timer/brasileira10novo.mp3")
+FINAL_AUDIO: str      = os.getenv("TIMER_FINAL_AUDIO", "./timer/ggboyz.mp3")
+FINALS_AUDIO: str     = os.getenv("TIMER_FINALS_AUDIO", "./timer/final.mp3")
 
 
 # --- small helpers -----------------------------------------------------------
@@ -82,19 +94,14 @@ def _voice_prereqs_ok() -> bool:
     return True
 
 
-# def _ffmpeg_src(path: str) -> discord.AudioSource:
-#     # Use Opus-encoded output from ffmpeg; avoids PCM encoding path.
-#     return discord.FFmpegOpusAudio(path, before_options="-nostdin", options="-vn")
-
 def _ffmpeg_src(path: str) -> discord.AudioSource:
     # Use Opus-encoded output from ffmpeg; avoids PCM encoding path.
     return discord.FFmpegOpusAudio(
         path,
         before_options="-nostdin",
         options="-vn",
-        executable=FFMPEG_EXE,  # 👈 key change
+        executable=FFMPEG_EXE,
     )
-
 
 
 # --- Cog ---------------------------------------------------------------------
@@ -102,6 +109,7 @@ def _ffmpeg_src(path: str) -> discord.AudioSource:
 class TimerCog(commands.Cog):
     """
     Joins to play audio and leaves after playback each time.
+    Posts a live, phase-colored embed with a progress bar that updates periodically.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -131,7 +139,8 @@ class TimerCog(commands.Cog):
             f"EXTRA_TURNS_MINUTES={EXTRA_TURNS_MINUTES}, "
             f"FINALS_GAME_PROBABILITY={FINALS_GAME_PROBABILITY}, "
             f"SWISS_HAVE_TO_WIN_PROBABILITY={SWISS_HAVE_TO_WIN_PROBABILITY}, "
-            f"BRASILEIRA_OFFSET_MINUTES={BRASILEIRA_OFFSET_MINUTES}"
+            f"BRASILEIRA_OFFSET_MINUTES={BRASILEIRA_OFFSET_MINUTES}, "
+            f"TIMER_UPDATE_INTERVAL_MINUTES={TIMER_UPDATE_INTERVAL_MINUTES}"
         )
 
     # ---------------- voice utils (ONLY inside the class) ----------------
@@ -245,112 +254,104 @@ class TimerCog(commands.Cog):
             print(f"[voice] _play returning {ok}")
             return ok
 
-    # ---------------- core actions ----------------
+    # ---------------- struct cleanup ----------------
 
-    async def timer_end(
-        self,
-        ctx: discord.ApplicationContext,
-        minutes: float,
-        message: str,
-        voice_file_path: Optional[str] = None,
-        *,
-        timer_id: Optional[str] = None,
-        edit: bool = False,
-        delete_after: Optional[float] = None,  # minutes
-    ):
-        delay_sec = max(0.0, minutes) * 60
-        print(
-            f"[timer_end] Scheduled fire: timer_id={timer_id}, minutes={minutes}, "
-            f"delay_sec={delay_sec}, voice_file_path={voice_file_path}, edit={edit}"
-        )
-        # Wait until this particular stage (main time, turns, final, etc.)
-        await asyncio.sleep(delay_sec)
+    def _cleanup_timer_structs(self, timer_id: str) -> None:
+        self.active_timers.pop(timer_id, None)
+        self.paused_timers.pop(timer_id, None)
+        self.timer_messages.pop(timer_id, None)
+        self.timer_tasks.pop(timer_id, None)
+        self.voice_channel_users.pop(timer_id, None)
 
-        print(
-            f"[timer_end] Firing: timer_id={timer_id}, message='{message[:40]}...', "
-            f"voice_file_path={voice_file_path}"
-        )
+    # ---------------- audio-only tasks ----------------
 
-        channel = ctx.channel
-        msg_obj: Optional[discord.Message] = None
-
-        if edit and timer_id and timer_id in self.timer_messages:
-            ch_id, m_id = self.timer_messages[timer_id]
-            ch = self.bot.get_channel(ch_id) or channel
-            try:
-                msg_obj = await ch.fetch_message(m_id)
-                await msg_obj.edit(content=message)
-            except Exception as e:
-                print(f"[timer_end] Failed to edit message: {e}")
-        else:
-            try:
-                msg_obj = await channel.send(message)
-                if timer_id:
-                    self.timer_messages[timer_id] = (channel.id, msg_obj.id)
-            except Exception as e:
-                print(f"[timer_end] Failed to send message: {e}")
-
-        # play scheduled audio and leave right after
-        vcid = None
-        if timer_id and timer_id in self.active_timers:
-            vcid = self.active_timers[timer_id].get("voice_channel_id")
-        if vcid is None and ctx.author.voice and ctx.author.voice.channel:
-            vcid = ctx.author.voice.channel.id
-
-        print(
-            f"[timer_end] About to play voice_file_path={voice_file_path} "
-            f"for timer_id={timer_id}, vcid={vcid}"
-        )
-
-        if voice_file_path and vcid is not None:
-            await self._play(ctx.guild, voice_file_path, channel_id=vcid, leave_after=True)
-
-        if delete_after is not None and msg_obj is not None:
-            delete_delay_sec = max(0.0, delete_after) * 60
-            print(
-                f"[timer_end] Scheduling deletion of message in {delete_delay_sec} seconds "
-                f"for timer_id={timer_id}"
-            )
-            await asyncio.sleep(delete_delay_sec)
-            with contextlib.suppress(Exception):
-                await msg_obj.delete()
-
-    async def play_voice_file(
-        self,
-        ctx: discord.ApplicationContext,
-        voice_file_path: str,
-        delay_seconds: float,
-        *,
-        timer_id: Optional[str] = None,
-    ):
-        """Play a given file after some delay, then leave VC."""
-        print(
-            f"[play_voice_file] Scheduled: timer_id={timer_id}, "
-            f"delay_seconds={delay_seconds}, path={voice_file_path}"
-        )
-        await asyncio.sleep(max(0.0, delay_seconds))
-
-        print(
-            f"[play_voice_file] Firing: timer_id={timer_id}, "
-            f"delay_seconds={delay_seconds}, path={voice_file_path}"
-        )
-
-        vcid = None
-        if timer_id and timer_id in self.active_timers:
-            vcid = self.active_timers[timer_id].get("voice_channel_id")
-        if vcid is None and ctx.author.voice and ctx.author.voice.channel:
-            vcid = ctx.author.voice.channel.id
-
-        print(
-            f"[play_voice_file] Using vcid={vcid} for timer_id={timer_id}, "
-            f"path={voice_file_path}"
-        )
-
-        if vcid is None:
-            print("[play_voice_file] No vcid resolved; skipping playback")
+    async def _audio_at(self, delay_sec: float, audio_path: str, timer_id: str, voice_channel_id: int):
+        """Sleep, then play audio. No message editing."""
+        await asyncio.sleep(max(0.0, delay_sec))
+        if timer_id not in self.active_timers:
             return
+        for g in self.bot.guilds:
+            if g.get_channel(voice_channel_id):
+                await self._play(g, audio_path, channel_id=voice_channel_id, leave_after=True)
+                return
 
-        await self._play(ctx.guild, voice_file_path, channel_id=vcid, leave_after=True)
+    async def _final_audio(self, delay_sec: float, audio_path: str, timer_id: str,
+                           voice_channel_id: int, draw_event: asyncio.Event):
+        """Sleep, play draw audio, then flag the embed loop to show the draw phase."""
+        await asyncio.sleep(max(0.0, delay_sec))
+        if timer_id not in self.active_timers:
+            return
+        guild = next((g for g in self.bot.guilds if g.get_channel(voice_channel_id)), None)
+        if guild:
+            await self._play(guild, audio_path, channel_id=voice_channel_id, leave_after=True)
+        data = self.active_timers.get(timer_id)
+        if data:
+            data["phase_override"] = "draw"
+        draw_event.set()
+
+    # ---------------- embed update loop (sole message editor) ----------------
+
+    async def _embed_update_loop(self, timer_id: str, vc_name: str):
+        interval = max(30.0, TIMER_UPDATE_INTERVAL_MINUTES * 60.0)
+        while True:
+            if timer_id not in self.active_timers:
+                return
+            data = self.active_timers[timer_id]
+            elapsed = (now_utc() - data["start_time"]).total_seconds()
+            durations = data["durations"]
+            main_dur, extra_dur = durations["main"], durations["extra"]
+            remaining_main = max(0.0, main_dur - elapsed)
+            remaining_total = max(0.0, main_dur + extra_dur - elapsed)
+
+            orig = data.get("original_durations") or durations
+            end_ts_main = ts(data["start_time"] + timedelta(seconds=main_dur))
+            end_ts_final = ts(data["start_time"] + timedelta(seconds=main_dur + extra_dur))
+            phase = pick_phase(remaining_main, remaining_total, data.get("phase_override"))
+
+            embed = build_timer_embed(
+                vc_name=vc_name, phase=phase,
+                main_total=orig["main"], extra_total=orig["extra"],
+                remaining_main=remaining_main, remaining_total=remaining_total,
+                end_ts_main=end_ts_main, end_ts_final=end_ts_final,
+                win_and_in=data.get("win_and_in", False),
+                title_prefix="(DEV) " if IS_DEV else "",
+            )
+
+            msg_info = self.timer_messages.get(timer_id)
+            if not msg_info:
+                print(f"[timer/loop] no message tracked for {timer_id}, exiting")
+                return
+            ch_id, m_id = msg_info
+            try:
+                ch = self.bot.get_channel(ch_id)
+                if ch is None:
+                    self._cleanup_timer_structs(timer_id)
+                    return
+                await ch.get_partial_message(m_id).edit(embed=embed)
+            except discord.NotFound:
+                print(f"[timer/loop] message deleted externally for {timer_id}, cleaning up")
+                self._cleanup_timer_structs(timer_id)
+                return
+            except Exception as e:
+                print(f"[timer/loop] edit failed for {timer_id}: {e}")
+
+            if phase == "draw":
+                await asyncio.sleep(60)
+                with contextlib.suppress(Exception):
+                    ch = self.bot.get_channel(ch_id)
+                    if ch:
+                        await ch.get_partial_message(m_id).delete()
+                self._cleanup_timer_structs(timer_id)
+                return
+
+            draw_event = data.get("draw_event")
+            if draw_event and not draw_event.is_set():
+                try:
+                    await asyncio.wait_for(draw_event.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass  # normal tick
+            else:
+                await asyncio.sleep(interval)
 
     # ---------------- utilities ----------------
 
@@ -373,13 +374,10 @@ class TimerCog(commands.Cog):
 
     async def set_timer_stopped(self, timer_id: str, reason: str = "track"):
         print(f"[set_timer_stopped] timer_id={timer_id}, reason={reason}")
-        if timer_id not in self.voice_channel_users:
-            print("[set_timer_stopped] timer_id not in voice_channel_users")
+        if timer_id not in self.active_timers and timer_id not in self.paused_timers:
+            print("[set_timer_stopped] no active/paused timer for this id")
             return
 
-        self.voice_channel_users[timer_id] = "stopped"
-        self.active_timers.pop(timer_id, None)
-        self.paused_timers.pop(timer_id, None)
         await self._cancel_tasks(timer_id)
 
         reason_text = "due to /track command." if reason == "track" else "due to /endtimer command."
@@ -390,7 +388,7 @@ class TimerCog(commands.Cog):
             if ch:
                 try:
                     msg = await ch.fetch_message(m_id)
-                    await msg.edit(content=f"Timer was stopped {reason_text}")
+                    await msg.edit(content=f"Timer was stopped {reason_text}", embed=None)
 
                     async def _del(m: discord.Message):
                         await asyncio.sleep(60)
@@ -400,48 +398,81 @@ class TimerCog(commands.Cog):
                     asyncio.create_task(_del(msg))
                 except Exception as e:
                     print(f"[set_timer_stopped] Failed to edit/delete message: {e}")
-            self.timer_messages.pop(timer_id, None)
+
+        self._cleanup_timer_structs(timer_id)
+
+    # ---------------- core timer start ----------------
+
+    async def _send_finals(self, ctx: discord.ApplicationContext, voice_channel: discord.VoiceChannel):
+        """Final game: no countdown, no progress bar — just an embed + audio."""
+        embed = discord.Embed(
+            title=f"{'(DEV) ' if IS_DEV else ''}⏱️ {voice_channel.name} — Final Game",
+            description=("This is a final game with **no time limit**. You may ID and restart "
+                         "in the same seats if you all have time, but it must end with a winner. "
+                         "Play accordingly."),
+            color=PHASE_COLORS["running"],
+        )
+        await ctx.followup.send(embed=embed)
+        await self._play(ctx.guild, FINALS_AUDIO, channel_id=voice_channel.id, leave_after=True)
+
+    async def _start_timed(self, ctx: discord.ApplicationContext,
+                           voice_channel: discord.VoiceChannel, *, win_and_in: bool):
+        """Start a timed round (regular or WIN & IN): live embed + 4 tasks."""
+        main_seconds = TIMER_MINUTES * 60.0
+        extra_seconds = EXTRA_TURNS_MINUTES * 60.0
+        egg_delay = max((TIMER_MINUTES - BRASILEIRA_OFFSET_MINUTES) * 60.0, 0.0)
+
+        vc_id = voice_channel.id
+        self.voice_channel_timers[vc_id] = self.voice_channel_timers.get(vc_id, 0) + 1
+        timer_id = make_timer_id(vc_id, self.voice_channel_timers[vc_id])
+        self.voice_channel_users[timer_id] = [str(m.id) for m in voice_channel.members]
+        self.timer_tasks[timer_id] = []
+        print(f"[timer] Using timer_id={timer_id}, win_and_in={win_and_in}")
+
+        start_time = now_utc()
+        end_ts_main = ts(start_time + timedelta(seconds=main_seconds))
+        end_ts_final = ts(start_time + timedelta(seconds=main_seconds + extra_seconds))
+
+        embed = build_timer_embed(
+            vc_name=voice_channel.name, phase="running",
+            main_total=main_seconds, extra_total=extra_seconds,
+            remaining_main=main_seconds, remaining_total=main_seconds + extra_seconds,
+            end_ts_main=end_ts_main, end_ts_final=end_ts_final,
+            win_and_in=win_and_in, title_prefix="(DEV) " if IS_DEV else "",
+        )
+        sent = await ctx.followup.send(embed=embed)
+        self.timer_messages[timer_id] = (sent.channel.id, sent.id)
+
+        draw_event = asyncio.Event()
+        self.active_timers[timer_id] = {
+            "start_time": start_time,
+            "durations": {"main": main_seconds, "easter_egg": egg_delay, "extra": extra_seconds},
+            "original_durations": {"main": main_seconds, "extra": extra_seconds},
+            "ctx": ctx,
+            "voice_channel_id": vc_id,
+            "vc_name": voice_channel.name,
+            "win_and_in": win_and_in,
+            "audio": {"turns": TURNS_AUDIO, "final": FINAL_AUDIO, "easter_egg": EASTER_EGG_AUDIO},
+            "phase_override": None,
+            "draw_event": draw_event,
+        }
+
+        # 4 tasks: embed loop + 3 audio-only
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._embed_update_loop(timer_id, voice_channel.name)))
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._audio_at(egg_delay, EASTER_EGG_AUDIO, timer_id, vc_id)))
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._audio_at(main_seconds, TURNS_AUDIO, timer_id, vc_id)))
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._final_audio(main_seconds + extra_seconds, FINAL_AUDIO, timer_id, vc_id, draw_event)))
+
+        print(f"[timer] Scheduled {len(self.timer_tasks[timer_id])} tasks for timer_id={timer_id}")
+
+        # intro audio (plays while the embed loop already runs)
+        await self._play(ctx.guild, INTRO_AUDIO, channel_id=vc_id, leave_after=True)
 
     # ---------------- commands ----------------
-
-    # @commands.slash_command(
-    #     guild_ids=[GUILD_ID],
-    #     name="vtest",
-    #     description="Minimal voice connect + play test",
-    # )
-    # async def vtest(self, ctx: discord.ApplicationContext):
-    #     """Minimal voice test: connect, play brasileira clip, disconnect."""
-    #     if not (ctx.author.voice and ctx.author.voice.channel):
-    #         return await ctx.respond("Join a voice channel first", ephemeral=True)
-
-    #     if not _voice_prereqs_ok():
-    #         return await ctx.respond(
-    #             "Voice prereqs not OK (Opus / PyNaCl). Check console.", ephemeral=True
-    #         )
-
-    #     ch = ctx.author.voice.channel
-    #     await ctx.respond("Connecting…")
-    #     try:
-    #         vc = await ch.connect(reconnect=False, timeout=15)
-    #     except Exception as e:
-    #         print(f"[vtest error] Voice connect failed: {type(e).__name__}: {e}")
-    #         return await ctx.followup.send(f"Connect failed: `{type(e).__name__}: {e}`")
-
-    #     if not vc.is_connected():
-    #         return await ctx.followup.send("Voice client not connected ❌")
-
-    #     await ctx.followup.send("Connected. Trying to play audio…")
-
-    #     try:
-    #         print("[vtest] Playing timer/brasileira10novo.mp3")
-    #         vc.play(discord.FFmpegPCMAudio("timer/brasileira10novo.mp3", executable=FFMPEG_EXE))
-    #         await asyncio.sleep(5)
-    #     except Exception as e:
-    #         print(f"[vtest error] Playback failed: {type(e).__name__}: {e}")
-    #         return await ctx.followup.send(f"Play failed: `{type(e).__name__}: {e}`")
-    #     finally:
-    #         print("[vtest] Disconnecting VC")
-    #         await vc.disconnect(force=True)
 
     @commands.slash_command(guild_ids=[GUILD_ID], name="timer", description="Start a match timer.")
     async def timer(self, ctx: discord.ApplicationContext):
@@ -454,237 +485,21 @@ class TimerCog(commands.Cog):
             return
 
         voice_channel = ctx.author.voice.channel
-
-        # Use env-driven values
-        minutes = TIMER_MINUTES
-        extra_time_for_turns = EXTRA_TURNS_MINUTES
-        finals_game_probability = FINALS_GAME_PROBABILITY
-        swiss_have_to_win_probability = SWISS_HAVE_TO_WIN_PROBABILITY
-
         rand_val = random.random()
-
         print(
             f"[timer] Called by user={ctx.author.id}, guild={ctx.guild.id}, "
-            f"voice_channel={voice_channel.id}, minutes={minutes}, "
-            f"extra_time_for_turns={extra_time_for_turns}, "
-            f"BRASILEIRA_OFFSET_MINUTES={BRASILEIRA_OFFSET_MINUTES}, "
-            f"rand_val={rand_val}"
+            f"voice_channel={voice_channel.id}, rand_val={rand_val}"
         )
 
-        vc_id = voice_channel.id
-        self.voice_channel_timers[vc_id] = self.voice_channel_timers.get(vc_id, 0) + 1
-        timer_id = make_timer_id(vc_id, self.voice_channel_timers[vc_id])
-        print(f"[timer] Using timer_id={timer_id}")
-
-        self.voice_channel_users[timer_id] = [str(m.id) for m in voice_channel.members]
-        if timer_id not in self.timer_tasks:
-            self.timer_tasks[timer_id] = []
-
         try:
-            # Finals: no timer, just explanation + final audio
-            if rand_val <= finals_game_probability:
+            if rand_val <= FINALS_GAME_PROBABILITY:
                 print("[timer] Branch: FINALS (no timer)")
-                await ctx.followup.send(
-                    "This is a final game with no time limit! You may ID and restart "
-                    "the match in the same positions if you all have time, but in the "
-                    "end it has to have a winner. Play accordingly."
-                )
-                await self._play(
-                    ctx.guild,
-                    "./timer/final.mp3",
-                    channel_id=voice_channel.id,
-                    leave_after=True,
-                )
+                await self._send_finals(ctx, voice_channel)
                 return
 
-            end_time = now_utc() + timedelta(minutes=minutes)
-            end_ts = ts(end_time)
-
-            # calculate brasileira delay for logging
-            brasileira_delay_sec = max((minutes - BRASILEIRA_OFFSET_MINUTES) * 60, 0.0)
-            print(
-                f"[timer] Calculated brasileira_delay_sec={brasileira_delay_sec} "
-                f"({brasileira_delay_sec/60:.2f} minutes from start)"
-            )
-
-            # WIN & IN branch
-            if rand_val <= finals_game_probability + swiss_have_to_win_probability:
-                print("[timer] Branch: WIN & IN")
-                sent = await ctx.followup.send(
-                    f"WIN & IN: Timer will start now and end <t:{end_ts}:R>. "
-                    f"You have to win to make the final cut!"
-                )
-                self.timer_messages[timer_id] = (sent.channel.id, sent.id)
-
-                turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = (
-                    f"Time is over. You have {int(extra_time_for_turns)} minutes to reach a conclusion. "
-                    f"Good luck ! - <t:{ts(turns_time)}:R>."
-                )
-
-
-                # schedule durations in seconds
-                main_seconds = minutes * 60
-                extra_seconds = extra_time_for_turns * 60
-
-                self.active_timers[timer_id] = {
-                    "start_time": now_utc(),
-                    "durations": {
-                        "main": main_seconds,
-                        # brasileira always N mins before main time ends
-                        "easter_egg": brasileira_delay_sec,
-                        "extra": extra_seconds,
-                    },
-                    "ctx": ctx,
-                    "voice_channel_id": voice_channel.id,
-                    "messages": {
-                        "turns": turns_msg,
-                        "final": "If no one won until now, the game is a draw. Well Played.",
-                        "win_and_in": True,
-                    },
-                    "audio": {
-                        "turns": "./timer/ap15minutes.mp3",
-                        "final": "./timer/ggboyz.mp3",
-                        "easter_egg": "./timer/brasileira10novo.mp3",
-                    },
-                }
-
-                # intro audio (WIN & IN) – you can swap to timer75 if you want
-                await self._play(
-                    ctx.guild,
-                    "./timer/timer75.mp3",
-                    channel_id=voice_channel.id,
-                    leave_after=True,
-                )
-
-                # main time end -> turns message + audio
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.timer_end(
-                            ctx,
-                            minutes,
-                            turns_msg,
-                            "./timer/ap15minutes.mp3",
-                            timer_id=timer_id,
-                            edit=True,
-                        )
-                    )
-                )
-                # brasileira N mins before end of main time
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.play_voice_file(
-                            ctx,
-                            "./timer/brasileira10novo.mp3",
-                            brasileira_delay_sec,
-                            timer_id=timer_id,
-                        )
-                    )
-                )
-                # final message after extra time
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.timer_end(
-                            ctx,
-                            minutes + extra_time_for_turns,
-                            "If no one won until now, the game is a draw. Well Played.",
-                            "./timer/ggboyz.mp3",
-                            timer_id=timer_id,
-                            edit=True,
-                            delete_after=1,
-                        )
-                    )
-                )
-
-            else:
-                # Regular swiss round
-                print("[timer] Branch: Regular swiss")
-                sent = await ctx.followup.send(
-                    f"Timer will start now and end <t:{end_ts}:R>. "
-                    f"Play to win and to your outs."
-                )
-                self.timer_messages[timer_id] = (sent.channel.id, sent.id)
-
-                turns_time = now_utc() + timedelta(minutes=extra_time_for_turns)
-                turns_msg = (
-                    f"Time is over. You have {int(extra_time_for_turns)} minutes to reach a conclusion. "
-                    f"Good luck ! - <t:{ts(turns_time)}:R>."
-                )
-
-
-                main_seconds = minutes * 60
-                extra_seconds = extra_time_for_turns * 60
-
-                self.active_timers[timer_id] = {
-                    "start_time": now_utc(),
-                    "durations": {
-                        "main": main_seconds,
-                        "easter_egg": brasileira_delay_sec,
-                        "extra": extra_seconds,
-                    },
-                    "ctx": ctx,
-                    "voice_channel_id": voice_channel.id,
-                    "messages": {
-                        "turns": turns_msg,
-                        "final": "If no one won until now, the game is a draw. Well Played.",
-                    },
-                    "audio": {
-                        "turns": "./timer/ap15minutes.mp3",
-                        "final": "./timer/ggboyz.mp3",
-                        "easter_egg": "./timer/brasileira10novo.mp3",
-                    },
-                }
-
-                # intro audio (regular swiss)
-                await self._play(
-                    ctx.guild,
-                    "./timer/timer75.mp3",
-                    channel_id=voice_channel.id,
-                    leave_after=True,
-                )
-
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.timer_end(
-                            ctx,
-                            minutes,
-                            turns_msg,
-                            "./timer/ap15minutes.mp3",
-                            timer_id=timer_id,
-                            edit=True,
-                        )
-                    )
-                )
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.play_voice_file(
-                            ctx,
-                            "./timer/brasileira10novo.mp3",
-                            brasileira_delay_sec,
-                            timer_id=timer_id,
-                        )
-                    )
-                )
-                self.timer_tasks[timer_id].append(
-                    asyncio.create_task(
-                        self.timer_end(
-                            ctx,
-                            minutes + extra_time_for_turns,
-                            "If no one won until now, the game is a draw. Well Played.",
-                            "./timer/ggboyz.mp3",
-                            timer_id=timer_id,
-                            edit=True,
-                            delete_after=1,
-                        )
-                    )
-                )
-
-            print(
-                f"[timer] Scheduled tasks for timer_id={timer_id}: "
-                f"{len(self.timer_tasks[timer_id])} tasks, "
-                f"brasileira_delay_sec={brasileira_delay_sec}"
-            )
-
+            win_and_in = rand_val <= (FINALS_GAME_PROBABILITY + SWISS_HAVE_TO_WIN_PROBABILITY)
+            print(f"[timer] Branch: {'WIN & IN' if win_and_in else 'Regular swiss'}")
+            await self._start_timed(ctx, voice_channel, win_and_in=win_and_in)
         except Exception as e:
             print(f"[timer] Fatal error: {e}")
 
@@ -743,44 +558,49 @@ class TimerCog(commands.Cog):
         timer_data = self.active_timers.pop(timer_id)
         elapsed = (now_utc() - timer_data["start_time"]).total_seconds()
         durations = timer_data["durations"]
+        remaining_main = max(durations["main"] - elapsed, 0.0)
+        remaining_total = max(durations["main"] + durations["extra"] - elapsed, 0.0)
         remaining = {
-            "main": max(durations["main"] - elapsed, 0),
-            # how long until brasileira from now
-            "easter_egg": max(durations["easter_egg"] - elapsed, 0),
-            # how long until final from now (main + extra - elapsed)
-            "extra": max(durations["extra"] - elapsed + durations["main"], 0),
+            "main": remaining_main,
+            "easter_egg": max(durations["easter_egg"] - elapsed, 0.0),
+            "extra": remaining_total - remaining_main,
         }
+        print(f"[pausetimer] elapsed={elapsed}, remaining={remaining}")
 
-        print(
-            f"[pausetimer] elapsed={elapsed}, durations={durations}, remaining={remaining}"
-        )
-
-        try:
-            ch_id, m_id = self.timer_messages.get(timer_id, (None, None))
-            if ch_id and m_id:
+        # delete the live timer message
+        ch_id, m_id = self.timer_messages.get(timer_id, (None, None))
+        if ch_id and m_id:
+            with contextlib.suppress(Exception):
                 ch = self.bot.get_channel(ch_id)
                 if ch:
                     orig = await ch.fetch_message(m_id)
                     await orig.delete()
-        except Exception as e:
-            print(f"[pausetimer] Error deleting original timer message: {e}")
 
-        remaining_minutes = int(remaining["main"] // 60)
-        pause_msg = await ctx.channel.send(
-            f"⏸️ Timer paused – **{remaining_minutes} minutes** remaining."
+        orig_durations = timer_data.get("original_durations") or durations
+        embed = build_timer_embed(
+            vc_name=timer_data["vc_name"], phase="paused",
+            main_total=orig_durations["main"], extra_total=orig_durations["extra"],
+            remaining_main=remaining_main, remaining_total=remaining_total,
+            end_ts_main=0, end_ts_final=0,
+            win_and_in=timer_data.get("win_and_in", False),
+            title_prefix="(DEV) " if IS_DEV else "",
         )
+        pause_msg = await ctx.followup.send(embed=embed)
+
         with contextlib.suppress(Exception):
             await ctx.interaction.delete_original_response()
 
         self.paused_timers[timer_id] = {
             "ctx": timer_data["ctx"],
             "remaining": remaining,
-            "messages": timer_data["messages"],
+            "original_durations": orig_durations,
             "audio": timer_data["audio"],
             "pause_message": pause_msg,
-            "win_and_in": timer_data["messages"].get("win_and_in", False),
             "voice_channel_id": timer_data.get("voice_channel_id"),
+            "vc_name": timer_data["vc_name"],
+            "win_and_in": timer_data.get("win_and_in", False),
         }
+        self.timer_messages[timer_id] = (pause_msg.channel.id, pause_msg.id)
 
     @commands.slash_command(
         guild_ids=[GUILD_ID],
@@ -812,85 +632,58 @@ class TimerCog(commands.Cog):
             with contextlib.suppress(Exception):
                 await pm.delete()
 
-        self.active_timers[timer_id] = {
-            "start_time": now_utc(),
-            "durations": paused["remaining"],
-            "messages": paused["messages"],
-            "audio": paused["audio"],
-            "voice_channel_id": paused.get("voice_channel_id"),
+        orig_durations = paused.get("original_durations") or {
+            "main": TIMER_MINUTES * 60.0, "extra": EXTRA_TURNS_MINUTES * 60.0,
         }
-        self.timer_tasks[timer_id] = []
-
-        old_ctx = paused["ctx"]
-        turns_msg = paused["messages"]["turns"]
-        final_msg = paused["messages"]["final"]
-        turns_audio = paused["audio"]["turns"]
-        final_audio = paused["audio"]["final"]
-        egg_audio = paused["audio"]["easter_egg"]
-
         main = paused["remaining"]["main"]
         egg = paused["remaining"]["easter_egg"]
         extra = paused["remaining"]["extra"]
+        total_remaining = main + extra
 
-        print(
-            f"[resumetimer] remaining main={main}, egg={egg}, extra={extra}, "
-            f"messages={paused['messages']}, audio={paused['audio']}"
-        )
+        draw_event = asyncio.Event()
+        phase = "running" if main > 0 else "extra"
+        start_time = now_utc()
+        end_ts_main = ts(start_time + timedelta(seconds=main))
+        end_ts_final = ts(start_time + timedelta(seconds=total_remaining))
 
-        # Main time finish -> turns
-        self.timer_tasks[timer_id].append(
-            asyncio.create_task(
-                self.timer_end(
-                    old_ctx,
-                    main / 60,
-                    turns_msg,
-                    turns_audio,
-                    timer_id=timer_id,
-                    edit=True,
-                )
-            )
+        vc_name = paused["vc_name"]
+        embed = build_timer_embed(
+            vc_name=vc_name, phase=phase,
+            main_total=orig_durations["main"], extra_total=orig_durations["extra"],
+            remaining_main=main, remaining_total=total_remaining,
+            end_ts_main=end_ts_main, end_ts_final=end_ts_final,
+            win_and_in=paused["win_and_in"], title_prefix="(DEV) " if IS_DEV else "",
         )
-        # Brasileira at remaining 'egg' seconds from now
-        self.timer_tasks[timer_id].append(
-            asyncio.create_task(
-                self.play_voice_file(
-                    old_ctx,
-                    egg_audio,
-                    egg,
-                    timer_id=timer_id,
-                )
-            )
-        )
-        # Final after remaining 'extra' seconds
-        self.timer_tasks[timer_id].append(
-            asyncio.create_task(
-                self.timer_end(
-                    old_ctx,
-                    extra / 60,
-                    final_msg,
-                    final_audio,
-                    timer_id=timer_id,
-                    edit=True,
-                    delete_after=1,
-                )
-            )
-        )
-
-        print(
-            f"[resumetimer] Scheduled {len(self.timer_tasks[timer_id])} tasks again "
-            f"for timer_id={timer_id}"
-        )
-
-        end_time = now_utc() + timedelta(seconds=main)
-        resume_text = (
-            f"WIN & IN: Timer has been resumed and will end <t:{ts(end_time)}:R>. "
-            f"You have to win to make the final cut!"
-            if paused.get("win_and_in", False)
-            else f"Timer has been resumed and will end <t:{ts(end_time)}:R>. "
-            f"Play to win and to your outs."
-        )
-        msg = await ctx.followup.send(resume_text)
+        msg = await ctx.followup.send(embed=embed)
         self.timer_messages[timer_id] = (msg.channel.id, msg.id)
+
+        vcid = paused.get("voice_channel_id")
+        self.active_timers[timer_id] = {
+            "start_time": start_time,
+            "durations": {"main": main, "easter_egg": egg, "extra": extra},
+            "original_durations": orig_durations,
+            "ctx": paused["ctx"],
+            "voice_channel_id": vcid,
+            "vc_name": vc_name,
+            "win_and_in": paused["win_and_in"],
+            "audio": paused["audio"],
+            "phase_override": None,
+            "draw_event": draw_event,
+        }
+        self.timer_tasks[timer_id] = []
+
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._embed_update_loop(timer_id, vc_name)))
+        if egg > 0:
+            self.timer_tasks[timer_id].append(asyncio.create_task(
+                self._audio_at(egg, paused["audio"]["easter_egg"], timer_id, vcid)))
+        if main > 0:
+            self.timer_tasks[timer_id].append(asyncio.create_task(
+                self._audio_at(main, paused["audio"]["turns"], timer_id, vcid)))
+        self.timer_tasks[timer_id].append(asyncio.create_task(
+            self._final_audio(total_remaining, paused["audio"]["final"], timer_id, vcid, draw_event)))
+
+        print(f"[resumetimer] Rescheduled {len(self.timer_tasks[timer_id])} tasks for {timer_id}")
 
 
 def setup(bot: commands.Bot):
