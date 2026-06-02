@@ -68,3 +68,9 @@ Thumbs.db
 **/.env.*
 **/*.env
 !.env.example
+
+
+# --- Claude Code (local-only, do not commit) ---
+.claude/
+CLAUDE.md
+CLAUDE.local.md
