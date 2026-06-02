@@ -21,3 +21,22 @@ def test_bar_full_at_draw():
 
 def test_bar_zero_total():
     assert build_progress_bar(0, 0, 0, 0) == "[----------]"
+
+
+from utils.timer_embed import pick_phase
+
+
+def test_phase_running():
+    assert pick_phase(100, 200, None) == "running"
+
+
+def test_phase_extra():
+    assert pick_phase(0, 200, None) == "extra"
+
+
+def test_phase_draw_when_nothing_left():
+    assert pick_phase(0, 0, None) == "draw"
+
+
+def test_phase_override_forces_draw():
+    assert pick_phase(100, 200, "draw") == "draw"

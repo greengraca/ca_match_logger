@@ -45,3 +45,14 @@ def build_progress_bar(
     filled_main = "█" * main_fill + "░" * (main_slots - main_fill)
     filled_extra = "█" * extra_fill + "░" * (extra_slots - extra_fill)
     return f"[{filled_main}|{filled_extra}]"
+
+
+def pick_phase(remaining_main: float, remaining_total: float, phase_override=None) -> str:
+    """running | extra | draw. phase_override='draw' forces the draw phase."""
+    if phase_override == "draw":
+        return "draw"
+    if remaining_main > 0:
+        return "running"
+    if remaining_total > 0:
+        return "extra"
+    return "draw"
